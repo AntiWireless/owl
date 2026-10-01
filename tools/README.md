@@ -78,12 +78,23 @@ suffix (`1 TU = 1024 µs`), e.g. `0.5`, `500ms`, `110tu`.
 | `--aw-period` | advertised Availability Window period in TU (default: 16) |
 | `--af-period` | advertised action-frame / PSF period in TU (default: 110) |
 | `--presence-mode` | advertised presence mode / EAW multiplier (default: 4) |
+| `--aw-offset` | availability-window phase offset in TU, may be negative (default: 0) |
 
 A genuine AWDL master announces action frames about every 110 TU
 (≈ 112 ms), so for realistic, hard-to-lose timing match the send cadence to
 it, e.g. `--interval 110tu`. Note that `--presence-mode` values other than
 `4` change the channel-sequence `step_count` and will be rejected by OWL
 peers (which expect a presence mode of 4).
+
+`--aw-offset` shifts the phase of the advertised availability-window
+schedule. Once the injected node is a peer's master, the peer reads our
+`time_to_next_aw` and `aw_counter` from the Sync Parameters TLV and re-aligns
+its own clock to them (`awdl_handle_sync_params_tlv` in `src/rx.c`), so the
+offset moves the AW phase every synchronised peer adopts. The countdown to
+the next AW and the AW sequence counter are shifted together, so `1` AW worth
+of offset (`--aw-period` TU, 16 by default) advances the sequence counter by
+one. Use it to steer — or deliberately desynchronise — a target's
+availability windows.
 
 Inspect a frame without touching the radio:
 

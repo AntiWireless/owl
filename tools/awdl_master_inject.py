@@ -202,7 +202,7 @@ class AwdlFrameBuilder:
     def __init__(self, src, dst, channel, master_metric, master_counter,
                  self_metric, self_counter, hostname, devclass,
                  aw_period=AW_PERIOD_TU, af_period=PSF_INTERVAL_MASTER_TU,
-                 presence_mode=PRESENCE_MODE):
+                 presence_mode=PRESENCE_MODE, aw_offset=0):
         self.src = src
         self.dst = dst
         self.channel = channel
@@ -217,6 +217,7 @@ class AwdlFrameBuilder:
         self.aw_period = aw_period            # Availability Window period (TU)
         self.af_period = af_period            # action-frame / PSF period (TU)
         self.presence_mode = presence_mode    # EAW multiplier (steps per EAW)
+        self.aw_offset = aw_offset            # AW phase offset in TU (may be <0)
 
         # We advertise ourselves as the top master: distance 0, master == self.
         self.master_addr = src
@@ -267,7 +268,12 @@ class AwdlFrameBuilder:
         chan_num, _ = CHAN_OPCLASS[self.channel]
 
         eaw_period = self.presence_mode * self.aw_period
-        time_since = usec_to_tu(now - self._t0)
+        # The AW phase offset shifts the countdown to the next AW and the AW
+        # sequence counter consistently, steering the availability-window phase
+        # a receiver re-synchronises to once we have become its master.  The
+        # receiver (awdl_handle_sync_params_tlv in src/rx.c) reads our
+        # time_to_next_aw and aw_counter and re-aligns its own clock to them.
+        time_since = usec_to_tu(now - self._t0) + self.aw_offset
         tx_down_counter = eaw_period - (time_since % eaw_period)
         current_aw = (0 + (time_since % eaw_period) // self.aw_period +
                       self.presence_mode * (time_since // eaw_period)) & 0xFFFF
@@ -475,6 +481,10 @@ def main(argv=None):
                         metavar="N",
                         help="advertised presence mode / EAW multiplier; values "
                              "other than 4 may be rejected by OWL peers")
+    timing.add_argument("--aw-offset", type=int, default=0, metavar="TU",
+                        help="availability-window phase offset in TU (1 TU = "
+                             "1024 us, 1 AW = --aw-period TU); may be negative. "
+                             "Shifts the AW schedule peers synchronise to")
     parser.add_argument("--psf", action="store_true",
                         help="also interleave PSF frames (default: MIF only)")
     parser.add_argument("--dry-run", action="store_true",
@@ -502,7 +512,7 @@ def main(argv=None):
         self_metric=metric, self_counter=counter,
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
         aw_period=args.aw_period, af_period=args.af_period,
-        presence_mode=args.presence_mode,
+        presence_mode=args.presence_mode, aw_offset=args.aw_offset,
     )
 
     if args.dry_run:
@@ -514,6 +524,7 @@ def main(argv=None):
         print("# election metric  : 0x%08x" % metric)
         print("# aw/af period     : %d / %d TU" % (args.aw_period, args.af_period))
         print("# presence mode    : %d" % args.presence_mode)
+        print("# aw offset        : %d TU" % args.aw_offset)
         print("# MIF frame length : %d bytes" % len(frame))
         print(frame.hex())
         return 0
@@ -528,9 +539,9 @@ def main(argv=None):
     print("    master   : %s  (counter=0x%08x metric=0x%08x)"
           % (mac_str(src), counter, metric))
     print("    directed at: %s" % mac_str(args.target))
-    print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d%s"
+    print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d offset=%dTU%s"
           % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
-             args.aw_period, args.af_period, args.presence_mode,
+             args.aw_period, args.af_period, args.presence_mode, args.aw_offset,
              "" if args.duration <= 0 else " duration=%gs" % args.duration))
     print("    (Ctrl-C to stop)")
 
