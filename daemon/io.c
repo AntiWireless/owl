@@ -358,16 +358,29 @@ void io_state_free(struct io_state *state) {
 	pcap_close(state->wlan_handle);
 }
 
+/* The driver TX queue can transiently fill up (send() returns EAGAIN),
+ * especially with USB Wi-Fi adapters. Retry the injection a bounded number of
+ * times with a short back-off instead of dropping the frame immediately. */
+#define WLAN_TX_MAX_RETRIES 10
+#define WLAN_TX_RETRY_DELAY_US 500
+
 int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {
 	int err;
+	int retries = 0;
 	if (!state || !state->wlan_handle)
 		return -EINVAL;
-	err = pcap_inject(state->wlan_handle, buf, len);
-	if (err < 0) {
+	for (;;) {
+		errno = 0;
+		err = pcap_inject(state->wlan_handle, buf, len);
+		if (err >= 0)
+			return 0;
+		if ((errno == EAGAIN || errno == EWOULDBLOCK) && retries++ < WLAN_TX_MAX_RETRIES) {
+			usleep(WLAN_TX_RETRY_DELAY_US);
+			continue; /* TX queue was full; wait briefly and try again */
+		}
 		log_error("unable to inject packet (%s)", pcap_geterr(state->wlan_handle));
 		return err;
 	}
-	return 0;
 }
 
 int host_send(const struct io_state *state, const uint8_t *buf, int len) {
