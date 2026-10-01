@@ -62,9 +62,11 @@ import argparse
 import fcntl
 import os
 import random
+import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 
@@ -123,6 +125,13 @@ UINT32_MAX = 0xFFFFFFFF
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
+# The only channels AWDL ever uses (the "social" channels), swept in this order
+# when no channel is given explicitly.
+AWDL_SOCIAL_CHANNELS = [6, 44, 149]
+SWEEP_DWELL_DEFAULT = 3.0        # seconds listened on each channel while sweeping
+
+ETH_P_ALL = 0x0003               # receive every frame on the monitor interface
+
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -164,6 +173,34 @@ def usec_to_tu(usec):
     return usec // 1024
 
 
+# 1 TU (time unit) = 1024 us, per IEEE 802.11 (src/ieee80211.h)
+_TIME_UNITS = {"us": 1e-6, "ms": 1e-3, "tu": 1024e-6, "s": 1.0}
+
+
+def parse_duration(text):
+    """Parse a time value into seconds.
+
+    Accepts a bare number (seconds) or a value with a unit suffix:
+    ``s`` (seconds), ``ms`` (milliseconds), ``us`` (microseconds) or
+    ``tu`` (802.11 time units, 1 TU = 1024 us).  Examples: ``0.5``,
+    ``500ms``, ``110tu``.
+    """
+    token = str(text).strip().lower()
+    multiplier = 1.0
+    for suffix in ("ms", "us", "tu", "s"):   # check two-char suffixes before "s"
+        if token.endswith(suffix) and token[:-len(suffix)]:
+            multiplier = _TIME_UNITS[suffix]
+            token = token[:-len(suffix)]
+            break
+    try:
+        value = float(token)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid time value: %r" % text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("time value must not be negative: %r" % text)
+    return value * multiplier
+
+
 # ---------------------------------------------------------------------------
 # frame construction (mirrors src/tx.c)
 # ---------------------------------------------------------------------------
@@ -172,7 +209,9 @@ class AwdlFrameBuilder:
     """Builds AWDL action frames identical in layout to ``src/tx.c``."""
 
     def __init__(self, src, dst, channel, master_metric, master_counter,
-                 self_metric, self_counter, hostname, devclass):
+                 self_metric, self_counter, hostname, devclass,
+                 aw_period=AW_PERIOD_TU, af_period=PSF_INTERVAL_MASTER_TU,
+                 presence_mode=PRESENCE_MODE, aw_offset=0):
         self.src = src
         self.dst = dst
         self.channel = channel
@@ -182,6 +221,12 @@ class AwdlFrameBuilder:
         self.self_counter = self_counter & UINT32_MAX
         self.hostname = hostname
         self.devclass = devclass
+
+        # AWDL timing parameters advertised in the Sync Parameters TLV.
+        self.aw_period = aw_period            # Availability Window period (TU)
+        self.af_period = af_period            # action-frame / PSF period (TU)
+        self.presence_mode = presence_mode    # EAW multiplier (steps per EAW)
+        self.aw_offset = aw_offset            # AW phase offset in TU (may be <0)
 
         # We advertise ourselves as the top master: distance 0, master == self.
         self.master_addr = src
@@ -221,7 +266,7 @@ class AwdlFrameBuilder:
                             AWDL_CHANSEQ_LENGTH - 1,    # count (+1)
                             AWDL_CHAN_ENC_OPCLASS,      # encoding
                             0,                          # duplicate_count
-                            3,                          # step_count (presence_mode-1)
+                            self.presence_mode - 1,     # step_count (presence_mode-1)
                             0xFFFF)                     # fill_channel
         entry = bytes([chan_num, opclass])              # opclass encoding = 2 bytes
         return block + entry * AWDL_CHANSEQ_LENGTH
@@ -231,14 +276,19 @@ class AwdlFrameBuilder:
         now = time.monotonic_ns() // 1000
         chan_num, _ = CHAN_OPCLASS[self.channel]
 
-        eaw_period = PRESENCE_MODE * AW_PERIOD_TU
-        time_since = usec_to_tu(now - self._t0)
+        eaw_period = self.presence_mode * self.aw_period
+        # The AW phase offset shifts the countdown to the next AW and the AW
+        # sequence counter consistently, steering the availability-window phase
+        # a receiver re-synchronises to once we have become its master.  The
+        # receiver (awdl_handle_sync_params_tlv in src/rx.c) reads our
+        # time_to_next_aw and aw_counter and re-aligns its own clock to them.
+        time_since = usec_to_tu(now - self._t0) + self.aw_offset
         tx_down_counter = eaw_period - (time_since % eaw_period)
-        current_aw = (0 + (time_since % eaw_period) // AW_PERIOD_TU +
-                      PRESENCE_MODE * (time_since // eaw_period)) & 0xFFFF
+        current_aw = (0 + (time_since % eaw_period) // self.aw_period +
+                      self.presence_mode * (time_since // eaw_period)) & 0xFFFF
 
-        aw_com_length = AW_PERIOD_TU
-        consumed = AW_PERIOD_TU * PRESENCE_MODE - tx_down_counter
+        aw_com_length = self.aw_period
+        consumed = self.aw_period * self.presence_mode - tx_down_counter
         remaining = 0 if aw_com_length < consumed else aw_com_length - consumed
 
         body = struct.pack(
@@ -250,18 +300,18 @@ class AwdlFrameBuilder:
             tx_down_counter & 0xFFFF,
             chan_num,                       # master_channel
             0,                              # guard_time
-            AW_PERIOD_TU,                   # aw_period
-            PSF_INTERVAL_MASTER_TU,         # af_period
+            self.aw_period,                 # aw_period
+            self.af_period,                 # af_period
             0x1800,                         # flags
-            AW_PERIOD_TU,                   # aw_ext_length
+            self.aw_period,                 # aw_ext_length
             aw_com_length,                  # aw_com_length
             remaining & 0xFFFF,             # remaining_aw_length
-            PRESENCE_MODE - 1,              # min_ext
-            PRESENCE_MODE - 1,              # max_ext_multicast
-            PRESENCE_MODE - 1,              # max_ext_unicast
-            PRESENCE_MODE - 1,              # max_ext_af
+            self.presence_mode - 1,         # min_ext
+            self.presence_mode - 1,         # max_ext_multicast
+            self.presence_mode - 1,         # max_ext_unicast
+            self.presence_mode - 1,         # max_ext_af
             self.master_addr,               # master_addr (== self, we are master)
-            PRESENCE_MODE,                  # presence_mode
+            self.presence_mode,             # presence_mode
             0,                              # reserved
             current_aw,                     # next_aw_seq
             current_aw,                     # ap_alignment
@@ -374,15 +424,103 @@ class AwdlFrameBuilder:
 # ---------------------------------------------------------------------------
 
 def open_injection_socket(ifname):
-    """Open a raw AF_PACKET socket bound to a monitor-mode interface."""
+    """Open a raw AF_PACKET socket bound to a monitor-mode interface.
+
+    Opened with ETH_P_ALL so the same socket can both inject frames and sniff
+    them (used by the channel sweep).
+    """
     try:
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                             socket.htons(ETH_P_ALL))
         sock.bind((ifname, 0))
     except PermissionError:
         sys.exit("error: need root to open a raw socket (try sudo)")
     except OSError as exc:
         sys.exit("error: cannot bind to interface %r: %s" % (ifname, exc))
     return sock
+
+
+def set_channel(ifname, channel):
+    """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success."""
+    try:
+        subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
+                       check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE)
+        return True
+    except FileNotFoundError:
+        print("    channel %d: cannot tune ('iw' not found)" % channel)
+        return False
+    except subprocess.CalledProcessError as exc:
+        reason = exc.stderr.decode(errors="replace").strip() or "rejected"
+        print("    channel %d: cannot tune (%s)" % (channel, reason))
+        return False
+
+
+def parse_awdl_src(buf):
+    """If ``buf`` is an AWDL action frame, return its source MAC, else None.
+
+    ``buf`` is a received monitor-mode frame: radiotap header + 802.11 frame.
+    """
+    if len(buf) < 4:
+        return None
+    rt_len = struct.unpack_from("<H", buf, 2)[0]      # radiotap it_len
+    # need the 24-byte 802.11 management header + the start of the action body
+    if len(buf) < rt_len + 24 + 5:
+        return None
+    frame_control = struct.unpack_from("<H", buf, rt_len)[0]
+    # management (type 0) + action (subtype 13) => low byte 0xD0
+    if frame_control & 0x00FC != 0x00D0:
+        return None
+    src = buf[rt_len + 10:rt_len + 16]                # addr2 = transmitter
+    body = buf[rt_len + 24:]
+    # action body: category(127) + OUI(00:17:f2) + type(8)
+    if body[0] == IEEE80211_VENDOR_SPECIFIC and body[1:4] == AWDL_OUI \
+            and body[4] == AWDL_TYPE:
+        return src
+    return None
+
+
+def _drain(sock):
+    """Discard any buffered frames so a sweep window only counts fresh ones."""
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.recv(4096)
+    except (BlockingIOError, OSError):
+        pass
+    finally:
+        sock.setblocking(True)
+
+
+def sweep_for_channel(sock, ifname, target, channels, dwell):
+    """Listen on each candidate channel and return the one with the most AWDL
+    frames from ``target`` (or None if the target is seen nowhere)."""
+    print("[*] sweeping for %s on channels %s (%.1fs each)"
+          % (mac_str(target), ",".join(str(c) for c in channels), dwell))
+    counts = {}
+    for ch in channels:
+        if not set_channel(ifname, ch):
+            continue
+        time.sleep(0.2)             # let the radio settle on the new channel
+        _drain(sock)
+        n = 0
+        sock.settimeout(0.5)
+        end = time.monotonic() + dwell
+        while time.monotonic() < end:
+            try:
+                buf = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if parse_awdl_src(buf) == target:
+                n += 1
+        counts[ch] = n
+        print("    channel %3d: %d AWDL frame(s) from target" % (ch, n))
+    sock.settimeout(None)
+    if not counts or max(counts.values()) == 0:
+        return None
+    return max(counts, key=counts.get)
 
 
 DEVCLASS_NAMES = {
@@ -406,8 +544,13 @@ def main(argv=None):
     parser.add_argument("-s", "--source", type=parse_mac, default=None,
                         help="source MAC / master identity to advertise "
                              "(default: interface MAC, else random local MAC)")
-    parser.add_argument("-c", "--channel", type=int, default=44,
-                        choices=sorted(CHAN_OPCLASS), help="AWDL social channel")
+    parser.add_argument("-c", "--channel", type=int, default=None,
+                        choices=sorted(CHAN_OPCLASS),
+                        help="AWDL social channel; if omitted, the channel is "
+                             "detected by sweeping for the target's frames")
+    parser.add_argument("--sweep-dwell", type=float, default=SWEEP_DWELL_DEFAULT,
+                        metavar="SECONDS",
+                        help="listen time per channel during channel detection")
     parser.add_argument("--metric", type=lambda x: int(x, 0), default=UINT32_MAX,
                         help="election master metric (default: 0xffffffff = max)")
     parser.add_argument("--counter", type=lambda x: int(x, 0), default=UINT32_MAX,
@@ -416,15 +559,47 @@ def main(argv=None):
                         help="hostname advertised in the Arpa TLV")
     parser.add_argument("--devclass", choices=sorted(DEVCLASS_NAMES),
                         default="macos", help="advertised device class")
-    parser.add_argument("--interval", type=float, default=1.0,
-                        help="seconds between frames (0 = send once and exit)")
     parser.add_argument("--count", type=int, default=0,
                         help="number of frames to send (0 = until interrupted)")
+
+    timing = parser.add_argument_group(
+        "timing", "control the send cadence and the AWDL timing parameters "
+                  "advertised in the Sync Parameters TLV")
+    timing.add_argument("--interval", type=parse_duration, default=1.0,
+                        metavar="TIME",
+                        help="time between send cycles; accepts an s/ms/us/tu "
+                             "suffix (e.g. 0.5, 500ms, 110tu). 0 = send once")
+    timing.add_argument("--duration", type=parse_duration, default=0,
+                        metavar="TIME",
+                        help="stop after this much time (same unit suffixes; "
+                             "0 = run until --count or Ctrl-C)")
+    timing.add_argument("--aw-period", type=int, default=AW_PERIOD_TU,
+                        metavar="TU",
+                        help="advertised Availability Window period in TU")
+    timing.add_argument("--af-period", type=int, default=PSF_INTERVAL_MASTER_TU,
+                        metavar="TU",
+                        help="advertised action-frame (PSF) period in TU")
+    timing.add_argument("--presence-mode", type=int, default=PRESENCE_MODE,
+                        metavar="N",
+                        help="advertised presence mode / EAW multiplier; values "
+                             "other than 4 may be rejected by OWL peers")
+    timing.add_argument("--aw-offset", type=int, default=0, metavar="TU",
+                        help="availability-window phase offset in TU (1 TU = "
+                             "1024 us, 1 AW = --aw-period TU); may be negative. "
+                             "Shifts the AW schedule peers synchronise to")
     parser.add_argument("--psf", action="store_true",
                         help="also interleave PSF frames (default: MIF only)")
     parser.add_argument("--dry-run", action="store_true",
                         help="build and hex-dump one frame without injecting")
     args = parser.parse_args(argv)
+
+    # Validate the timing parameters (they must fit the on-wire fields).
+    if not 1 <= args.presence_mode <= 16:
+        parser.error("--presence-mode must be between 1 and 16")
+    if not 1 <= args.aw_period <= 0xFFFF:
+        parser.error("--aw-period must be between 1 and 65535 TU")
+    if not 1 <= args.af_period <= 0xFFFF:
+        parser.error("--af-period must be between 1 and 65535 TU")
 
     src = args.source
     if src is None:
@@ -433,36 +608,82 @@ def main(argv=None):
     metric = args.metric & UINT32_MAX
     counter = args.counter & UINT32_MAX
 
+    # Resolve the channel. If none was given, open the radio and sweep the
+    # social channels for the target's AWDL frames, then lock onto the one it
+    # is actually on. In --dry-run there is no live radio, so fall back to 44.
+    sock = None
+    if args.dry_run:
+        channel = args.channel if args.channel is not None else 44
+        if args.channel is None:
+            print("# note: no -c given; using channel %d for --dry-run "
+                  "(detection needs a live radio)" % channel)
+    else:
+        sock = open_injection_socket(args.interface)
+        channel = args.channel
+        have_iw = shutil.which("iw") is not None
+        if channel is None:
+            if not have_iw:
+                sock.close()
+                sys.exit("error: 'iw' is required to detect the channel; "
+                         "install it or pass -c/--channel")
+            channel = sweep_for_channel(sock, args.interface, args.target,
+                                        AWDL_SOCIAL_CHANNELS, args.sweep_dwell)
+            if channel is None:
+                sock.close()
+                sys.exit("error: target %s not seen on any AWDL channel; "
+                         "pass -c/--channel to set it manually"
+                         % mac_str(args.target))
+            print("[*] detected target on channel %d" % channel)
+            if not set_channel(args.interface, channel):
+                sock.close()
+                sys.exit("error: could not tune interface to channel %d" % channel)
+        elif have_iw:
+            set_channel(args.interface, channel)  # best-effort; may be tuned already
+        else:
+            print("[*] 'iw' not found; assuming %s is already on channel %d"
+                  % (args.interface, channel))
+
     builder = AwdlFrameBuilder(
-        src=src, dst=args.target, channel=args.channel,
+        src=src, dst=args.target, channel=channel,
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
+        aw_period=args.aw_period, af_period=args.af_period,
+        presence_mode=args.presence_mode, aw_offset=args.aw_offset,
     )
 
     if args.dry_run:
         frame = builder.build(AWDL_ACTION_MIF)
         print("# source (master) : %s" % mac_str(src))
         print("# target (dst)    : %s" % mac_str(args.target))
-        print("# channel         : %d" % args.channel)
+        print("# channel         : %d" % channel)
         print("# election counter : 0x%08x" % counter)
         print("# election metric  : 0x%08x" % metric)
+        print("# aw/af period     : %d / %d TU" % (args.aw_period, args.af_period))
+        print("# presence mode    : %d" % args.presence_mode)
+        print("# aw offset        : %d TU" % args.aw_offset)
         print("# MIF frame length : %d bytes" % len(frame))
         print(frame.hex())
         return 0
 
-    sock = open_injection_socket(args.interface)
+    # sock was opened above while resolving the channel.
 
     # graceful Ctrl-C
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(flag=True))
 
-    print("[*] injecting AWDL MIF on %s (ch %d)" % (args.interface, args.channel))
+    print("[*] injecting AWDL MIF on %s (ch %d)" % (args.interface, channel))
     print("    master   : %s  (counter=0x%08x metric=0x%08x)"
           % (mac_str(src), counter, metric))
     print("    directed at: %s" % mac_str(args.target))
+    print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d offset=%dTU%s"
+          % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
+             args.aw_period, args.af_period, args.presence_mode, args.aw_offset,
+             "" if args.duration <= 0 else " duration=%gs" % args.duration))
     print("    (Ctrl-C to stop)")
 
+    start = time.monotonic()
+    deadline = start + args.duration if args.duration > 0 else None
     sent = 0
     try:
         while not stop["flag"]:
@@ -476,10 +697,14 @@ def main(argv=None):
                 break
             if args.interval <= 0:
                 break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
 
-            # sleep in small slices so Ctrl-C is responsive
+            # sleep in small slices so Ctrl-C (and the deadline) stay responsive
             slept = 0.0
             while slept < args.interval and not stop["flag"]:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 step = min(0.1, args.interval - slept)
                 time.sleep(step)
                 slept += step
