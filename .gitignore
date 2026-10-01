@@ -5,3 +5,7 @@ cmake-build-release/
 
 # Build files
 build/
+
+# Python
+__pycache__/
+*.pyc
