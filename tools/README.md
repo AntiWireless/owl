@@ -61,10 +61,29 @@ Useful options:
 | `-s, --source` | master identity to advertise (default: interface MAC) |
 | `-c, --channel` | AWDL social channel: 6, 44 or 149 (default: 44) |
 | `--counter` / `--metric` | election counter / metric (default: `0xffffffff`) |
-| `--interval` | seconds between frames (default: 1.0; `0` = send once) |
 | `--count` | number of frames to send (`0` = until Ctrl-C) |
 | `--psf` | also interleave PSF frames |
 | `--dry-run` | build and hex-dump one frame without injecting |
+
+### Timing
+
+The send cadence and the AWDL timing parameters advertised in the Sync
+Parameters TLV are configurable. Durations accept an `s`/`ms`/`us`/`tu`
+suffix (`1 TU = 1024 µs`), e.g. `0.5`, `500ms`, `110tu`.
+
+| option | meaning |
+| --- | --- |
+| `--interval` | time between send cycles (default: 1.0 s; `0` = send once) |
+| `--duration` | stop after this much time (default: `0` = until `--count`/Ctrl-C) |
+| `--aw-period` | advertised Availability Window period in TU (default: 16) |
+| `--af-period` | advertised action-frame / PSF period in TU (default: 110) |
+| `--presence-mode` | advertised presence mode / EAW multiplier (default: 4) |
+
+A genuine AWDL master announces action frames about every 110 TU
+(≈ 112 ms), so for realistic, hard-to-lose timing match the send cadence to
+it, e.g. `--interval 110tu`. Note that `--presence-mode` values other than
+`4` change the channel-sequence `step_count` and will be rejected by OWL
+peers (which expect a presence mode of 4).
 
 Inspect a frame without touching the radio:
 

@@ -164,6 +164,34 @@ def usec_to_tu(usec):
     return usec // 1024
 
 
+# 1 TU (time unit) = 1024 us, per IEEE 802.11 (src/ieee80211.h)
+_TIME_UNITS = {"us": 1e-6, "ms": 1e-3, "tu": 1024e-6, "s": 1.0}
+
+
+def parse_duration(text):
+    """Parse a time value into seconds.
+
+    Accepts a bare number (seconds) or a value with a unit suffix:
+    ``s`` (seconds), ``ms`` (milliseconds), ``us`` (microseconds) or
+    ``tu`` (802.11 time units, 1 TU = 1024 us).  Examples: ``0.5``,
+    ``500ms``, ``110tu``.
+    """
+    token = str(text).strip().lower()
+    multiplier = 1.0
+    for suffix in ("ms", "us", "tu", "s"):   # check two-char suffixes before "s"
+        if token.endswith(suffix) and token[:-len(suffix)]:
+            multiplier = _TIME_UNITS[suffix]
+            token = token[:-len(suffix)]
+            break
+    try:
+        value = float(token)
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid time value: %r" % text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("time value must not be negative: %r" % text)
+    return value * multiplier
+
+
 # ---------------------------------------------------------------------------
 # frame construction (mirrors src/tx.c)
 # ---------------------------------------------------------------------------
@@ -172,7 +200,9 @@ class AwdlFrameBuilder:
     """Builds AWDL action frames identical in layout to ``src/tx.c``."""
 
     def __init__(self, src, dst, channel, master_metric, master_counter,
-                 self_metric, self_counter, hostname, devclass):
+                 self_metric, self_counter, hostname, devclass,
+                 aw_period=AW_PERIOD_TU, af_period=PSF_INTERVAL_MASTER_TU,
+                 presence_mode=PRESENCE_MODE):
         self.src = src
         self.dst = dst
         self.channel = channel
@@ -182,6 +212,11 @@ class AwdlFrameBuilder:
         self.self_counter = self_counter & UINT32_MAX
         self.hostname = hostname
         self.devclass = devclass
+
+        # AWDL timing parameters advertised in the Sync Parameters TLV.
+        self.aw_period = aw_period            # Availability Window period (TU)
+        self.af_period = af_period            # action-frame / PSF period (TU)
+        self.presence_mode = presence_mode    # EAW multiplier (steps per EAW)
 
         # We advertise ourselves as the top master: distance 0, master == self.
         self.master_addr = src
@@ -221,7 +256,7 @@ class AwdlFrameBuilder:
                             AWDL_CHANSEQ_LENGTH - 1,    # count (+1)
                             AWDL_CHAN_ENC_OPCLASS,      # encoding
                             0,                          # duplicate_count
-                            3,                          # step_count (presence_mode-1)
+                            self.presence_mode - 1,     # step_count (presence_mode-1)
                             0xFFFF)                     # fill_channel
         entry = bytes([chan_num, opclass])              # opclass encoding = 2 bytes
         return block + entry * AWDL_CHANSEQ_LENGTH
@@ -231,14 +266,14 @@ class AwdlFrameBuilder:
         now = time.monotonic_ns() // 1000
         chan_num, _ = CHAN_OPCLASS[self.channel]
 
-        eaw_period = PRESENCE_MODE * AW_PERIOD_TU
+        eaw_period = self.presence_mode * self.aw_period
         time_since = usec_to_tu(now - self._t0)
         tx_down_counter = eaw_period - (time_since % eaw_period)
-        current_aw = (0 + (time_since % eaw_period) // AW_PERIOD_TU +
-                      PRESENCE_MODE * (time_since // eaw_period)) & 0xFFFF
+        current_aw = (0 + (time_since % eaw_period) // self.aw_period +
+                      self.presence_mode * (time_since // eaw_period)) & 0xFFFF
 
-        aw_com_length = AW_PERIOD_TU
-        consumed = AW_PERIOD_TU * PRESENCE_MODE - tx_down_counter
+        aw_com_length = self.aw_period
+        consumed = self.aw_period * self.presence_mode - tx_down_counter
         remaining = 0 if aw_com_length < consumed else aw_com_length - consumed
 
         body = struct.pack(
@@ -250,18 +285,18 @@ class AwdlFrameBuilder:
             tx_down_counter & 0xFFFF,
             chan_num,                       # master_channel
             0,                              # guard_time
-            AW_PERIOD_TU,                   # aw_period
-            PSF_INTERVAL_MASTER_TU,         # af_period
+            self.aw_period,                 # aw_period
+            self.af_period,                 # af_period
             0x1800,                         # flags
-            AW_PERIOD_TU,                   # aw_ext_length
+            self.aw_period,                 # aw_ext_length
             aw_com_length,                  # aw_com_length
             remaining & 0xFFFF,             # remaining_aw_length
-            PRESENCE_MODE - 1,              # min_ext
-            PRESENCE_MODE - 1,              # max_ext_multicast
-            PRESENCE_MODE - 1,              # max_ext_unicast
-            PRESENCE_MODE - 1,              # max_ext_af
+            self.presence_mode - 1,         # min_ext
+            self.presence_mode - 1,         # max_ext_multicast
+            self.presence_mode - 1,         # max_ext_unicast
+            self.presence_mode - 1,         # max_ext_af
             self.master_addr,               # master_addr (== self, we are master)
-            PRESENCE_MODE,                  # presence_mode
+            self.presence_mode,             # presence_mode
             0,                              # reserved
             current_aw,                     # next_aw_seq
             current_aw,                     # ap_alignment
@@ -416,15 +451,43 @@ def main(argv=None):
                         help="hostname advertised in the Arpa TLV")
     parser.add_argument("--devclass", choices=sorted(DEVCLASS_NAMES),
                         default="macos", help="advertised device class")
-    parser.add_argument("--interval", type=float, default=1.0,
-                        help="seconds between frames (0 = send once and exit)")
     parser.add_argument("--count", type=int, default=0,
                         help="number of frames to send (0 = until interrupted)")
+
+    timing = parser.add_argument_group(
+        "timing", "control the send cadence and the AWDL timing parameters "
+                  "advertised in the Sync Parameters TLV")
+    timing.add_argument("--interval", type=parse_duration, default=1.0,
+                        metavar="TIME",
+                        help="time between send cycles; accepts an s/ms/us/tu "
+                             "suffix (e.g. 0.5, 500ms, 110tu). 0 = send once")
+    timing.add_argument("--duration", type=parse_duration, default=0,
+                        metavar="TIME",
+                        help="stop after this much time (same unit suffixes; "
+                             "0 = run until --count or Ctrl-C)")
+    timing.add_argument("--aw-period", type=int, default=AW_PERIOD_TU,
+                        metavar="TU",
+                        help="advertised Availability Window period in TU")
+    timing.add_argument("--af-period", type=int, default=PSF_INTERVAL_MASTER_TU,
+                        metavar="TU",
+                        help="advertised action-frame (PSF) period in TU")
+    timing.add_argument("--presence-mode", type=int, default=PRESENCE_MODE,
+                        metavar="N",
+                        help="advertised presence mode / EAW multiplier; values "
+                             "other than 4 may be rejected by OWL peers")
     parser.add_argument("--psf", action="store_true",
                         help="also interleave PSF frames (default: MIF only)")
     parser.add_argument("--dry-run", action="store_true",
                         help="build and hex-dump one frame without injecting")
     args = parser.parse_args(argv)
+
+    # Validate the timing parameters (they must fit the on-wire fields).
+    if not 1 <= args.presence_mode <= 16:
+        parser.error("--presence-mode must be between 1 and 16")
+    if not 1 <= args.aw_period <= 0xFFFF:
+        parser.error("--aw-period must be between 1 and 65535 TU")
+    if not 1 <= args.af_period <= 0xFFFF:
+        parser.error("--af-period must be between 1 and 65535 TU")
 
     src = args.source
     if src is None:
@@ -438,6 +501,8 @@ def main(argv=None):
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
+        aw_period=args.aw_period, af_period=args.af_period,
+        presence_mode=args.presence_mode,
     )
 
     if args.dry_run:
@@ -447,6 +512,8 @@ def main(argv=None):
         print("# channel         : %d" % args.channel)
         print("# election counter : 0x%08x" % counter)
         print("# election metric  : 0x%08x" % metric)
+        print("# aw/af period     : %d / %d TU" % (args.aw_period, args.af_period))
+        print("# presence mode    : %d" % args.presence_mode)
         print("# MIF frame length : %d bytes" % len(frame))
         print(frame.hex())
         return 0
@@ -461,8 +528,14 @@ def main(argv=None):
     print("    master   : %s  (counter=0x%08x metric=0x%08x)"
           % (mac_str(src), counter, metric))
     print("    directed at: %s" % mac_str(args.target))
+    print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d%s"
+          % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
+             args.aw_period, args.af_period, args.presence_mode,
+             "" if args.duration <= 0 else " duration=%gs" % args.duration))
     print("    (Ctrl-C to stop)")
 
+    start = time.monotonic()
+    deadline = start + args.duration if args.duration > 0 else None
     sent = 0
     try:
         while not stop["flag"]:
@@ -476,10 +549,14 @@ def main(argv=None):
                 break
             if args.interval <= 0:
                 break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
 
-            # sleep in small slices so Ctrl-C is responsive
+            # sleep in small slices so Ctrl-C (and the deadline) stay responsive
             slept = 0.0
             while slept < args.interval and not stop["flag"]:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 step = min(0.1, args.interval - slept)
                 time.sleep(step)
                 slept += step
