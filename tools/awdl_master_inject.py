@@ -59,6 +59,7 @@ Example:
 """
 
 import argparse
+import errno
 import fcntl
 import os
 import random
@@ -131,6 +132,12 @@ AWDL_SOCIAL_CHANNELS = [6, 44, 149]
 SWEEP_DWELL_DEFAULT = 3.0        # seconds listened on each channel while sweeping
 
 ETH_P_ALL = 0x0003               # receive every frame on the monitor interface
+
+# The driver TX queue can transiently fill up (send() raises EAGAIN/ENOBUFS),
+# common with USB Wi-Fi adapters. Retry a bounded number of times with a short
+# back-off instead of dropping the frame.
+TX_RETRY_MAX = 10
+TX_RETRY_DELAY = 0.0005          # 500 us between retries
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +447,24 @@ def open_injection_socket(ifname):
     return sock
 
 
+def send_frame(sock, frame):
+    """Inject one frame, retrying briefly when the driver TX queue is full.
+
+    Returns True if the frame went out, False if it was dropped after the
+    retry budget was exhausted.
+    """
+    for _ in range(TX_RETRY_MAX + 1):
+        try:
+            sock.send(frame)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS):
+                time.sleep(TX_RETRY_DELAY)   # queue full; wait briefly and retry
+                continue
+            raise
+    return False
+
+
 def set_channel(ifname, channel):
     """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success."""
     try:
@@ -685,13 +710,18 @@ def main(argv=None):
     start = time.monotonic()
     deadline = start + args.duration if args.duration > 0 else None
     sent = 0
+    dropped = 0
     try:
         while not stop["flag"]:
-            sock.send(builder.build(AWDL_ACTION_MIF))
-            sent += 1
-            if args.psf:
-                sock.send(builder.build(AWDL_ACTION_PSF))
+            if send_frame(sock, builder.build(AWDL_ACTION_MIF)):
                 sent += 1
+            else:
+                dropped += 1
+            if args.psf:
+                if send_frame(sock, builder.build(AWDL_ACTION_PSF)):
+                    sent += 1
+                else:
+                    dropped += 1
 
             if args.count and sent >= args.count:
                 break
@@ -711,7 +741,10 @@ def main(argv=None):
     finally:
         sock.close()
 
-    print("\n[*] done, sent %d frame(s)" % sent)
+    msg = "\n[*] done, sent %d frame(s)" % sent
+    if dropped:
+        msg += " (%d dropped after TX-queue retries)" % dropped
+    print(msg)
     return 0
 
 
