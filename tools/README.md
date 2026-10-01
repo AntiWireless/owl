@@ -70,7 +70,35 @@ Useful options:
 | `--counter` / `--metric` | election counter / metric (default: `0xffffffff`) |
 | `--count` | number of frames to send (`0` = until Ctrl-C) |
 | `--psf` | also interleave PSF frames |
+| `--watch` | inject *and* listen on the same card; report each peer's master |
 | `--dry-run` | build and hex-dump one frame without injecting |
+
+### Verifying with a single card (`--watch`)
+
+Monitor mode keeps receiving while you inject, so one card can both send the
+master frames and watch the result. With `--watch` the tool listens on the
+same interface and prints, once a second, which master every AWDL peer in
+range currently advertises — so you can see whether the target adopted you,
+without a second radio or `tshark`:
+
+```sh
+sudo ./awdl_master_inject.py -i wlan0 -t 66:aa:30:33:93:af -c 6 \
+     -s 00:c0:ca:bd:09:8a --interval 110tu --watch
+```
+
+```
+[watch] 66:aa:30:33:93:af -> master 00:c0:ca:bd:09:8a (self_counter=1902)  <== ADOPTED YOU
+```
+
+When the target's advertised master flips to your `-s` address, it has
+adopted you as the AWDL master. Notes:
+
+* Real AWDL masters broadcast their MIFs, so against a genuine (e.g. Apple)
+  device use `-t ff:ff:ff:ff:ff:ff` — many implementations only run the
+  election on broadcast MIFs.
+* Peers hop across 6/44/149, so a target pinned-watched on one channel only
+  shows up intermittently. Apple devices also keep AWDL dormant unless an
+  AWDL feature is active, so keep one in use on the target while testing.
 
 ### Timing
 

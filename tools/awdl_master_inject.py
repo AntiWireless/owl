@@ -505,6 +505,79 @@ def parse_awdl_src(buf):
     return None
 
 
+def parse_awdl_election(buf):
+    """Parse a received AWDL action frame's Election Parameters v2 TLV.
+
+    Returns a tuple (src, master_addr, master_counter, self_counter) where
+    master_addr is None if the frame is AWDL but carries no v2 TLV, or None if
+    the frame is not an AWDL action frame at all.
+    """
+    if len(buf) < 4:
+        return None
+    rt_len = struct.unpack_from("<H", buf, 2)[0]
+    base = rt_len + 24                       # start of the AWDL action body
+    if len(buf) < base + 16:
+        return None
+    frame_control = struct.unpack_from("<H", buf, rt_len)[0]
+    if frame_control & 0x00FC != 0x00D0:     # mgmt + action
+        return None
+    body = buf[base:]
+    if not (body[0] == IEEE80211_VENDOR_SPECIFIC and body[1:4] == AWDL_OUI
+            and body[4] == AWDL_TYPE):
+        return None
+    src = buf[rt_len + 10:rt_len + 16]
+    tlvs = body[16:]                         # after the 16-byte awdl_action header
+    i = 0
+    while i + 3 <= len(tlvs):
+        ttype = tlvs[i]
+        tlen = struct.unpack_from("<H", tlvs, i + 1)[0]
+        val = tlvs[i + 3:i + 3 + tlen]
+        if ttype == AWDL_ELECTION_PARAMETERS_V2_TLV and len(val) >= 40:
+            master_addr = val[0:6]
+            master_counter = struct.unpack_from("<I", val, 12)[0]
+            self_counter = struct.unpack_from("<I", val, 36)[0]
+            return (src, master_addr, master_counter, self_counter)
+        i += 3 + tlen
+    return (src, None, None, None)           # AWDL frame, but no v2 TLV
+
+
+def watch_poll(sock, our_src, state):
+    """Drain buffered RX frames and update ``state`` with each peer's master.
+
+    ``state`` maps peer MAC string -> (master MAC string, self_counter, seen_at).
+    Frames from our own source are skipped.
+    """
+    sock.setblocking(False)
+    try:
+        while True:
+            try:
+                buf = sock.recv(4096)
+            except (BlockingIOError, OSError):
+                break
+            info = parse_awdl_election(buf)
+            if not info:
+                continue
+            psrc, maddr, _mctr, sctr = info
+            if psrc == our_src or maddr is None:
+                continue
+            state[mac_str(psrc)] = (mac_str(maddr), sctr, time.monotonic())
+    finally:
+        sock.setblocking(True)
+
+
+def watch_report(state, our_src_str):
+    """Print one line per known peer; prune entries not seen for 15 s."""
+    now = time.monotonic()
+    for peer in sorted(state):
+        maddr, sctr, seen = state[peer]
+        if now - seen > 15:
+            del state[peer]
+            continue
+        tag = "  <== ADOPTED YOU" if maddr == our_src_str else ""
+        print("    [watch] %s -> master %s (self_counter=%s)%s"
+              % (peer, maddr, sctr, tag))
+
+
 def _drain(sock):
     """Discard any buffered frames so a sweep window only counts fresh ones."""
     sock.setblocking(False)
@@ -614,6 +687,10 @@ def main(argv=None):
                              "Shifts the AW schedule peers synchronise to")
     parser.add_argument("--psf", action="store_true",
                         help="also interleave PSF frames (default: MIF only)")
+    parser.add_argument("--watch", action="store_true",
+                        help="while injecting, also listen on the same card and "
+                             "report which master each AWDL peer advertises "
+                             "(shows whether the target adopted you)")
     parser.add_argument("--dry-run", action="store_true",
                         help="build and hex-dump one frame without injecting")
     args = parser.parse_args(argv)
@@ -705,7 +782,13 @@ def main(argv=None):
           % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
              args.aw_period, args.af_period, args.presence_mode, args.aw_offset,
              "" if args.duration <= 0 else " duration=%gs" % args.duration))
+    if args.watch:
+        print("    watching   : reporting each AWDL peer's advertised master")
     print("    (Ctrl-C to stop)")
+
+    src_str = mac_str(src)
+    watch_state = {}
+    last_report = time.monotonic()
 
     start = time.monotonic()
     deadline = start + args.duration if args.duration > 0 else None
@@ -722,6 +805,13 @@ def main(argv=None):
                     sent += 1
                 else:
                     dropped += 1
+
+            if args.watch:
+                watch_poll(sock, src, watch_state)
+                now = time.monotonic()
+                if now - last_report >= 1.0:
+                    watch_report(watch_state, src_str)
+                    last_report = now
 
             if args.count and sent >= args.count:
                 break
