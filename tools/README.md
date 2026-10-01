@@ -36,22 +36,28 @@ implementations.
 ### Requirements
 
 * Linux, Python 3.6+, **root**
-* a Wi-Fi card in **monitor mode** on the right social channel (6, 44 or 149)
+* a Wi-Fi card in **monitor mode**
+* `iw` (used for channel detection and tuning; only needed if you let the tool
+  pick the channel)
 
 No third-party Python modules are needed (raw `AF_PACKET` injection).
 
 ### Usage
 
 ```sh
-# 1. put the card into monitor mode on the target's channel
+# 1. put the card into monitor mode (channel is auto-detected below)
 sudo ip link set wlan0 down
 sudo iw dev wlan0 set type monitor
 sudo ip link set wlan0 up
-sudo iw dev wlan0 set channel 44
 
-# 2. inject MIFs at a specific target MAC until interrupted
-sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44
+# 2. inject MIFs at a specific target MAC; the channel is detected automatically
+sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66
 ```
+
+With no `-c`, the tool sweeps the three AWDL social channels (6, 44, 149),
+counts AWDL frames coming *from the target MAC* on each, tunes the card to the
+one with the most, and injects there. Pass `-c` to skip detection and force a
+channel.
 
 Useful options:
 
@@ -59,7 +65,8 @@ Useful options:
 | --- | --- |
 | `-t, --target` | destination MAC the frames are directed at (required) |
 | `-s, --source` | master identity to advertise (default: interface MAC) |
-| `-c, --channel` | AWDL social channel: 6, 44 or 149 (default: 44) |
+| `-c, --channel` | AWDL social channel 6/44/149 (default: auto-detect by sweep) |
+| `--sweep-dwell` | seconds to listen per channel while detecting (default: 3.0) |
 | `--counter` / `--metric` | election counter / metric (default: `0xffffffff`) |
 | `--count` | number of frames to send (`0` = until Ctrl-C) |
 | `--psf` | also interleave PSF frames |

