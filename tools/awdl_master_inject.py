@@ -123,6 +123,8 @@ PRESENCE_MODE = 4
 PSF_INTERVAL_MASTER_TU = 110
 
 UINT32_MAX = 0xFFFFFFFF
+MASTER_COUNTER_BASE = 0x40000000  # start high; advance so the master stays live
+MASTER_COUNTER_STEP = 1
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
@@ -651,8 +653,10 @@ def main(argv=None):
                         help="listen time per channel during channel detection")
     parser.add_argument("--metric", type=lambda x: int(x, 0), default=UINT32_MAX,
                         help="election master metric (default: 0xffffffff = max)")
-    parser.add_argument("--counter", type=lambda x: int(x, 0), default=UINT32_MAX,
-                        help="election master counter (default: 0xffffffff = max)")
+    parser.add_argument("--counter", type=lambda x: int(x, 0),
+                        default=MASTER_COUNTER_BASE,
+                        help="starting election master counter; advances every "
+                             "frame so the master stays live (default 0x40000000)")
     parser.add_argument("--hostname", default="owl-master",
                         help="hostname advertised in the Arpa TLV")
     parser.add_argument("--devclass", choices=sorted(DEVCLASS_NAMES),
@@ -805,6 +809,11 @@ def main(argv=None):
                     sent += 1
                 else:
                     dropped += 1
+
+            # keep the master "live": advance the counter so it is never stale
+            builder.master_counter = min(
+                builder.master_counter + MASTER_COUNTER_STEP, UINT32_MAX)
+            builder.self_counter = builder.master_counter
 
             if args.watch:
                 watch_poll(sock, src, watch_state)
