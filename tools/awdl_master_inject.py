@@ -134,6 +134,7 @@ BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 AWDL_SOCIAL_CHANNELS = [6, 44, 149]
 SWEEP_DWELL_DEFAULT = 3.0        # seconds listened on each channel while sweeping
 CHANNEL_DWELL_DEFAULT = 1.0      # seconds injected on each channel while rotating
+SOCKET_TIMEOUT = 0.5             # seconds for all socket operations (allows Ctrl+C)
 
 ETH_P_ALL = 0x0003               # receive every frame on the monitor interface
 
@@ -496,6 +497,7 @@ def open_injection_socket(ifname):
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                              socket.htons(ETH_P_ALL))
         sock.bind((ifname, 0))
+        sock.settimeout(SOCKET_TIMEOUT)
     except PermissionError:
         sys.exit("error: need root to open a raw socket (try sudo)")
     except OSError as exc:
@@ -513,6 +515,8 @@ def send_frame(sock, frame):
         try:
             sock.send(frame)
             return True
+        except socket.timeout:
+            continue
         except OSError as exc:
             if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS):
                 time.sleep(TX_RETRY_DELAY)   # queue full; wait briefly and retry
@@ -526,10 +530,13 @@ def set_channel(ifname, channel):
     try:
         subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
                        check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE)
+                       stderr=subprocess.PIPE, timeout=5)
         return True
     except FileNotFoundError:
         print("    channel %d: cannot tune ('iw' not found)" % channel)
+        return False
+    except subprocess.TimeoutExpired:
+        print("    channel %d: cannot tune (timeout)" % channel)
         return False
     except subprocess.CalledProcessError as exc:
         reason = exc.stderr.decode(errors="replace").strip() or "rejected"
@@ -608,7 +615,7 @@ def watch_poll(sock, our_src, state):
         while True:
             try:
                 buf = sock.recv(4096)
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError, socket.timeout):
                 break
             info = parse_awdl_election(buf)
             if not info:
@@ -624,14 +631,17 @@ def watch_poll(sock, our_src, state):
 def watch_report(state, our_src_str):
     """Print one line per known peer; prune entries not seen for 15 s."""
     now = time.monotonic()
+    to_delete = []
     for peer in sorted(state):
         maddr, sctr, seen = state[peer]
         if now - seen > 15:
-            del state[peer]
+            to_delete.append(peer)
             continue
         tag = "  <== ADOPTED YOU" if maddr == our_src_str else ""
         print("    [watch] %s -> master %s (self_counter=%s)%s"
               % (peer, maddr, sctr, tag))
+    for peer in to_delete:
+        del state[peer]
 
 
 def _drain(sock):
@@ -639,9 +649,11 @@ def _drain(sock):
     sock.setblocking(False)
     try:
         while True:
-            sock.recv(4096)
-    except (BlockingIOError, OSError):
-        pass
+            try:
+                sock.recv(4096)
+            except (BlockingIOError, OSError, socket.timeout):
+                pass
+            break
     finally:
         sock.setblocking(True)
 
@@ -658,7 +670,6 @@ def sweep_for_channel(sock, ifname, target, channels, dwell):
         time.sleep(0.2)             # let the radio settle on the new channel
         _drain(sock)
         n = 0
-        sock.settimeout(0.5)
         end = time.monotonic() + dwell
         while time.monotonic() < end:
             try:
@@ -671,7 +682,6 @@ def sweep_for_channel(sock, ifname, target, channels, dwell):
                 n += 1
         counts[ch] = n
         print("    channel %3d: %d AWDL frame(s) from target" % (ch, n))
-    sock.settimeout(None)
     if not counts or max(counts.values()) == 0:
         return None
     return max(counts, key=counts.get)
@@ -858,9 +868,11 @@ def main(argv=None):
     rotate_channels = channel_list
     multi = len(rotate_channels) > 1
 
-    # graceful Ctrl-C
+    # graceful Ctrl+C
     stop = {"flag": False}
-    signal.signal(signal.SIGINT, lambda *_: stop.update(flag=True))
+    def signal_handler(sig, frame):
+        stop["flag"] = True
+    signal.signal(signal.SIGINT, signal_handler)
 
     chan_str = ",".join(str(c) for c in rotate_channels)
     print("[*] injecting AWDL MIF on %s (ch %s)" % (args.interface, chan_str))
@@ -930,7 +942,7 @@ def main(argv=None):
             if deadline is not None and time.monotonic() >= deadline:
                 break
 
-            # sleep in small slices so Ctrl-C, the deadline and the channel
+            # sleep in small slices so Ctrl+C, the deadline and the channel
             # switch all stay responsive
             slept = 0.0
             while slept < args.interval and not stop["flag"]:
