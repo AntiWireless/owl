@@ -42,13 +42,30 @@ implementations.
 
 No third-party Python modules are needed (raw `AF_PACKET` injection).
 
+### Preparing the Wi-Fi stick
+
+`awdl_prepare_stick.sh` gets a card ready for injection. It forces a **clean,
+plain monitor interface** — recreating the interface to drop any stale
+*active* monitor flag, which is the root cause of the peer-instability seen on
+USB adapters such as the `mt76x0u` — and sets a **regulatory domain** that
+permits the 5 GHz AWDL channels (44/149):
+
+```sh
+sudo ./awdl_prepare_stick.sh wlan0 44        # <iface> [channel] [regdomain]
+```
+
+The injector can do this for you with `--setup` (optionally `--regdomain CC`),
+so a one-liner prepares the card and injects:
+
+```sh
+sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44 --setup
+```
+
 ### Usage
 
 ```sh
-# 1. put the card into monitor mode (channel is auto-detected below)
-sudo ip link set wlan0 down
-sudo iw dev wlan0 set type monitor
-sudo ip link set wlan0 up
+# 1. prepare the card (clean plain monitor + regulatory domain)
+sudo ./awdl_prepare_stick.sh wlan0
 
 # 2. inject MIFs at a specific target MAC; the channel is detected automatically
 sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66
@@ -71,6 +88,8 @@ Useful options:
 | `--count` | number of frames to send (`0` = until Ctrl-C) |
 | `--psf` | also interleave PSF frames |
 | `--watch` | inject *and* listen on the same card; report each peer's master |
+| `--setup` | prepare the stick first (clean plain monitor + regulatory domain) |
+| `--regdomain` | ISO country code applied by `--setup` (default: `US`) |
 | `--dry-run` | build and hex-dump one frame without injecting |
 
 ### Verifying with a single card (`--watch`)
@@ -136,6 +155,55 @@ Inspect a frame without touching the radio:
 ```sh
 ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44 --dry-run
 ```
+
+### Integrating with other code (`ParamStore`)
+
+The injection loop reads **every live parameter from a `ParamStore` (a
+thread-safe "Zwischenspeicher") before building each frame**, so you can drive
+it from your own code by mutating that store — the next injected frame picks
+the new values up. No restart, no CLI.
+
+The store holds `target`, `source`, `channel`, `master_metric`,
+`master_counter`, `self_metric`, `self_counter`, `awdl_version`, `hostname`,
+`devclass` and `aw_offset`. Call `run_injection(sock, store, builder, iface,
+...)` (optionally in a thread, with a `threading.Event` to stop it):
+
+```python
+import threading, awdl_master_inject as awdl
+
+store = awdl.ParamStore(
+    target=awdl.parse_mac("ff:ff:ff:ff:ff:ff"),
+    source=awdl.parse_mac("de:ad:be:ef:00:01"),
+    channel=6,
+    master_metric=awdl.UINT32_MAX, master_counter=awdl.MASTER_COUNTER_BASE,
+    self_metric=awdl.UINT32_MAX,   self_counter=awdl.MASTER_COUNTER_BASE,
+    awdl_version=0xa0, hostname="owl-master",
+    devclass=awdl.DEVCLASS_NAMES["macos"], aw_offset=0)
+
+sock = awdl.open_injection_socket("wlan0")
+builder = awdl.AwdlFrameBuilder(
+    src=store.get("source"), dst=store.get("target"), channel=6,
+    master_metric=awdl.UINT32_MAX, master_counter=awdl.MASTER_COUNTER_BASE,
+    self_metric=awdl.UINT32_MAX,   self_counter=awdl.MASTER_COUNTER_BASE,
+    hostname="owl-master", devclass=awdl.DEVCLASS_NAMES["macos"])
+
+stop = threading.Event()
+threading.Thread(target=awdl.run_injection,
+                 args=(sock, store, builder, "wlan0"),
+                 kwargs=dict(interval=0.11, stop=stop)).start()
+
+# from your own code, at any time:
+store.update(target=awdl.parse_mac("66:aa:30:33:93:af"))  # live target change
+store.update(source=awdl.parse_mac("de:ad:be:ef:00:02"))  # live identity change
+
+stop.set()            # end the loop
+sock.close()
+```
+
+The election counter advances automatically every frame (so the master never
+looks stale); write `master_counter` through `store.update(...)` only if you
+want to override it. In single-channel mode a changed `channel` re-tunes the
+radio on the next cycle; with `rotate_channels` the rotation owns the channel.
 
 ### ⚠️ Authorised use only
 

