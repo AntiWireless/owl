@@ -91,7 +91,8 @@ Useful options:
 
 | option | meaning |
 | --- | --- |
-| `-t, --target` | destination MAC(s) the frames are directed at — comma-separated and/or repeatable (required) |
+| `-t, --target` | destination MAC(s) the frames are directed at — comma-separated and/or repeatable (required unless `--track`) |
+| `--track` | AWDL hostname(s) to follow; resolved to the current MAC by sniffing, re-targeted automatically as it rotates |
 | `-s, --source` | master identity to advertise (default: interface MAC) |
 | `-c, --channel` | AWDL social channel 6/44/149 (default: auto-detect by sweep) |
 | `--sweep-dwell` | seconds to listen per channel while detecting (default: 3.0) |
@@ -102,6 +103,31 @@ Useful options:
 | `--setup` | prepare the stick first (clean plain monitor + regulatory domain) |
 | `--regdomain` | ISO country code applied by `--setup` (default: `US`) |
 | `--dry-run` | build and hex-dump one frame without injecting |
+
+### Following a device across MAC rotation (`--track`)
+
+Apple devices rotate their Wi-Fi / AWDL MAC, so a MAC you pass to `-t` goes
+stale and you'd have to keep looking it up. They do, however, keep
+broadcasting a **stable hostname** in their MIFs (the Arpa TLV — the device
+name, e.g. `Peters-iPad`). AWDL carries no device *UUID* that survives
+rotation, but that hostname is a persistent handle, so `--track` follows it:
+
+```sh
+sudo ./awdl_master_inject.py -i wlan0 -c 6 --track "Peters-iPad"
+```
+
+The tool sniffs on the same card, resolves each tracked hostname to the
+device's **current** transmitter MAC, and re-targets automatically whenever
+the MAC rotates — you never re-enter a MAC. Notes:
+
+* Matching is case-insensitive. Give several names comma-separated and/or by
+  repeating `--track`, and combine freely with fixed `-t` MACs.
+* Until a tracked device is first heard, nothing is injected for it; a
+  `[track] <name> -> <mac>` line is printed on first resolve and on each
+  rotation (`[track] <name> rotated <old> -> <new>`).
+* The device must be actively sending AWDL (keep an AWDL feature in use), and
+  the hostname is whatever the device advertises (its name under *Settings →
+  General → About → Name*).
 
 ### Verifying with a single card (`--watch`)
 
@@ -217,6 +243,16 @@ The election counter advances automatically every frame (so the master never
 looks stale); write `master_counter` through `store.update(...)` only if you
 want to override it. In single-channel mode a changed `channel` re-tunes the
 radio on the next cycle; with `rotate_channels` the rotation owns the channel.
+
+To follow devices by hostname from your own code, build a `HostnameTracker`
+and pass it to `run_injection(..., tracker=tracker)`; it keeps the store's
+`targets` in sync as MACs rotate:
+
+```python
+tracker = awdl.HostnameTracker(store, fixed=[], names=["Peters-iPad"])
+# ... run_injection(sock, store, builder, "wlan0", tracker=tracker, stop=stop)
+# store.get("targets") now tracks Peters-iPad's current MAC automatically
+```
 
 ### ⚠️ Authorised use only
 

