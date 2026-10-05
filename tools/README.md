@@ -76,11 +76,22 @@ counts AWDL frames coming *from the target MAC* on each, tunes the card to the
 one with the most, and injects there. Pass `-c` to skip detection and force a
 channel.
 
+**Multiple targets:** give several destination MACs — comma-separated, by
+repeating `-t`, or both — and one frame is sent to each per cycle:
+
+```sh
+sudo ./awdl_master_inject.py -i wlan0 -c 6 \
+     -t 66:aa:30:33:93:af,66:aa:30:33:93:b0 -t 11:22:33:44:55:66
+```
+
+(When detecting the channel, the sweep counts frames from *any* of the
+targets.)
+
 Useful options:
 
 | option | meaning |
 | --- | --- |
-| `-t, --target` | destination MAC the frames are directed at (required) |
+| `-t, --target` | destination MAC(s) the frames are directed at — comma-separated and/or repeatable (required) |
 | `-s, --source` | master identity to advertise (default: interface MAC) |
 | `-c, --channel` | AWDL social channel 6/44/149 (default: auto-detect by sweep) |
 | `--sweep-dwell` | seconds to listen per channel while detecting (default: 3.0) |
@@ -163,16 +174,17 @@ thread-safe "Zwischenspeicher") before building each frame**, so you can drive
 it from your own code by mutating that store — the next injected frame picks
 the new values up. No restart, no CLI.
 
-The store holds `target`, `source`, `channel`, `master_metric`,
-`master_counter`, `self_metric`, `self_counter`, `awdl_version`, `hostname`,
-`devclass` and `aw_offset`. Call `run_injection(sock, store, builder, iface,
-...)` (optionally in a thread, with a `threading.Event` to stop it):
+The store holds `targets` (a **list** of destination MACs), `source`,
+`channel`, `master_metric`, `master_counter`, `self_metric`, `self_counter`,
+`awdl_version`, `hostname`, `devclass` and `aw_offset`. One frame is sent to
+each MAC in `targets` per cycle. Call `run_injection(sock, store, builder,
+iface, ...)` (optionally in a thread, with a `threading.Event` to stop it):
 
 ```python
 import threading, awdl_master_inject as awdl
 
 store = awdl.ParamStore(
-    target=awdl.parse_mac("ff:ff:ff:ff:ff:ff"),
+    targets=[awdl.parse_mac("ff:ff:ff:ff:ff:ff")],
     source=awdl.parse_mac("de:ad:be:ef:00:01"),
     channel=6,
     master_metric=awdl.UINT32_MAX, master_counter=awdl.MASTER_COUNTER_BASE,
@@ -182,7 +194,7 @@ store = awdl.ParamStore(
 
 sock = awdl.open_injection_socket("wlan0")
 builder = awdl.AwdlFrameBuilder(
-    src=store.get("source"), dst=store.get("target"), channel=6,
+    src=store.get("source"), dst=store.get("targets")[0], channel=6,
     master_metric=awdl.UINT32_MAX, master_counter=awdl.MASTER_COUNTER_BASE,
     self_metric=awdl.UINT32_MAX,   self_counter=awdl.MASTER_COUNTER_BASE,
     hostname="owl-master", devclass=awdl.DEVCLASS_NAMES["macos"])
@@ -193,8 +205,9 @@ threading.Thread(target=awdl.run_injection,
                  kwargs=dict(interval=0.11, stop=stop)).start()
 
 # from your own code, at any time:
-store.update(target=awdl.parse_mac("66:aa:30:33:93:af"))  # live target change
-store.update(source=awdl.parse_mac("de:ad:be:ef:00:02"))  # live identity change
+store.update(targets=[awdl.parse_mac("66:aa:30:33:93:af"),   # live target list
+                      awdl.parse_mac("66:aa:30:33:93:b0")])
+store.update(source=awdl.parse_mac("de:ad:be:ef:00:02"))     # live identity change
 
 stop.set()            # end the loop
 sock.close()
