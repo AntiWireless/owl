@@ -96,10 +96,12 @@ Useful options:
 | `-s, --source` | master identity to advertise (default: interface MAC) |
 | `-c, --channel` | AWDL social channel 6/44/149 (default: auto-detect by sweep) |
 | `--sweep-dwell` | seconds to listen per channel while detecting (default: 3.0) |
-| `--counter` / `--metric` | election counter / metric (default: `0xffffffff`) |
+| `--metric` | election master metric (default: `0xffffffff`) |
+| `--counter` | starting election master counter (default: `0x40000000`) |
+| `--counter-interval` | how often the counter is advanced (default: `1s`; `0` = never) |
 | `--count` | number of frames to send (`0` = until Ctrl-C) |
 | `--psf` | also interleave PSF frames |
-| `--watch` | inject *and* listen on the same card; report each peer's master |
+| `--watch` | inject *and* listen on the same card; report each peer's master (and hostname) |
 | `--setup` | prepare the stick first (clean plain monitor + regulatory domain) |
 | `--regdomain` | ISO country code applied by `--setup` (default: `US`) |
 | `--dry-run` | build and hex-dump one frame without injecting |
@@ -134,8 +136,9 @@ the MAC rotates — you never re-enter a MAC. Notes:
 Monitor mode keeps receiving while you inject, so one card can both send the
 master frames and watch the result. With `--watch` the tool listens on the
 same interface and prints, once a second, which master every AWDL peer in
-range currently advertises — so you can see whether the target adopted you,
-without a second radio or `tshark`:
+range currently advertises — plus the peer's **hostname** when it advertises
+one — so you can see whether the target adopted you, and discover a device's
+name to pass to `--track`, without a second radio or `tshark`:
 
 ```sh
 sudo ./awdl_master_inject.py -i wlan0 -t 66:aa:30:33:93:af -c 6 \
@@ -143,7 +146,7 @@ sudo ./awdl_master_inject.py -i wlan0 -t 66:aa:30:33:93:af -c 6 \
 ```
 
 ```
-[watch] 66:aa:30:33:93:af -> master 00:c0:ca:bd:09:8a (self_counter=1902)  <== ADOPTED YOU
+[watch] 66:aa:30:33:93:af (Peters-iPad) -> master 00:c0:ca:bd:09:8a (self_counter=1902)  <== ADOPTED YOU
 ```
 
 When the target's advertised master flips to your `-s` address, it has
@@ -239,10 +242,12 @@ stop.set()            # end the loop
 sock.close()
 ```
 
-The election counter advances automatically every frame (so the master never
-looks stale); write `master_counter` through `store.update(...)` only if you
-want to override it. In single-channel mode a changed `channel` re-tunes the
-radio on the next cycle; with `rotate_channels` the rotation owns the channel.
+The election counter advances automatically on a timer (`counter_interval`,
+default 1 s) so the master never looks stale — advancing it *per frame* makes
+the victim re-elect on every frame, so each value is held for many frames;
+write `master_counter` through `store.update(...)` only if you want to
+override it. In single-channel mode a changed `channel` re-tunes the radio on
+the next cycle; with `rotate_channels` the rotation owns the channel.
 
 To follow devices by hostname from your own code, build a `HostnameTracker`
 and pass it to `run_injection(..., tracker=tracker)`; it keeps the store's
