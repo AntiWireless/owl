@@ -287,7 +287,9 @@ def parse_duration(text):
 def parse_channels(text):
     """Parse a comma-separated channel list like ``6,44,149`` into ints.
 
-    Each channel must be a supported AWDL social channel.
+    Each channel must be a supported AWDL social channel. Duplicates are kept
+    (and preserve order), so a channel can be listed more than once to weight
+    the rotation towards it, e.g. ``6,6,44,149`` spends half the time on 6.
     """
     chans = []
     for part in str(text).split(","):
@@ -302,8 +304,7 @@ def parse_channels(text):
             raise argparse.ArgumentTypeError(
                 "unsupported channel %d (use %s)"
                 % (ch, "/".join(str(c) for c in sorted(CHAN_OPCLASS))))
-        if ch not in chans:
-            chans.append(ch)
+        chans.append(ch)
     if not chans:
         raise argparse.ArgumentTypeError("no channels given")
     return chans
@@ -753,23 +754,34 @@ def send_frame(sock, frame):
     return False
 
 
-def set_channel(ifname, channel):
-    """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success."""
-    try:
-        subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
-                       check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, timeout=5)
-        return True
-    except FileNotFoundError:
-        print("    channel %d: cannot tune ('iw' not found)" % channel)
-        return False
-    except subprocess.TimeoutExpired:
-        print("    channel %d: cannot tune (timeout)" % channel)
-        return False
-    except subprocess.CalledProcessError as exc:
-        reason = exc.stderr.decode(errors="replace").strip() or "rejected"
+def set_channel(ifname, channel, retries=3, quiet=False):
+    """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success.
+
+    The driver transiently rejects a channel change while it is busy -- common
+    when hopping quickly -- so retry a few times with a short back-off before
+    giving up. With ``quiet`` the final failure is not printed (used on the
+    rotation hot path, which tallies failures itself).
+    """
+    reason = "rejected"
+    for attempt in range(retries + 1):
+        try:
+            subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=5)
+            return True
+        except FileNotFoundError:
+            if not quiet:
+                print("    channel %d: cannot tune ('iw' not found)" % channel)
+            return False
+        except subprocess.TimeoutExpired:
+            reason = "timeout"
+        except subprocess.CalledProcessError as exc:
+            reason = exc.stderr.decode(errors="replace").strip() or "rejected"
+        if attempt < retries:
+            time.sleep(0.02)        # driver busy; brief back-off and retry
+    if not quiet:
         print("    channel %d: cannot tune (%s)" % (channel, reason))
-        return False
+    return False
 
 
 def parse_awdl_info(buf):
@@ -1004,6 +1016,7 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
     start = time.monotonic()
     deadline = start + duration if duration > 0 else None
     sent = dropped = 0
+    hop_fail = 0
     ci = 0
     current_channel = None
     next_switch = time.monotonic() + channel_dwell
@@ -1019,16 +1032,29 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
 
         # Re-tune the radio when the desired channel changes. In rotation mode
         # the rotation owns the channel (and the active one is reflected back
-        # into the store); otherwise the store's channel wins.
+        # into the store); otherwise the store's channel wins. Only commit the
+        # new channel when the tune actually succeeded -- a failed hop would
+        # otherwise leave us injecting on the wrong channel while believing we
+        # moved, so we keep the old channel and retry on the next cycle.
         desired = rotate_channels[ci] if multi else snap["channel"]
         if desired != current_channel:
-            set_channel(ifname, desired)
-            current_channel = desired
-            if multi:
-                store.update(channel=desired)
+            if set_channel(ifname, desired, quiet=True):
+                current_channel = desired
+                if multi:
+                    store.update(channel=desired)
+            else:
+                hop_fail += 1
 
         apply_snapshot(builder, snap)
         builder.channel = current_channel
+
+        if current_channel is None:
+            # The very first tune failed; wait briefly and retry rather than
+            # inject on an unknown channel (but still honour stop / deadline).
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+            continue
 
         # Send one frame to each target this cycle (same master identity and
         # election parameters, just a different destination MAC per frame).
@@ -1085,6 +1111,9 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
             time.sleep(step)
             slept += step
 
+    if hop_fail:
+        print("[!] %d channel hop(s) were rejected by the driver and retried; "
+              "shorten --channels or raise --channel-dwell if frequent" % hop_fail)
     return sent, dropped
 
 
