@@ -166,12 +166,14 @@ PSF_INTERVAL_MASTER_TU = 110
 UINT32_MAX = 0xFFFFFFFF
 MASTER_COUNTER_BASE = 0x40000000  # start high; advance so the master stays live
 MASTER_COUNTER_STEP = 1
-# Advance the counter on a timer, not per frame: every frame carrying a *new*
-# counter value is treated by the victim as a fresh master generation and only
-# settles after it has seen that value repeated, so bumping every frame keeps it
-# perpetually re-electing. Holding each value for ~1 s (many frames) is still far
-# inside the ~10 s staleness window that would mark the master dead.
-MASTER_COUNTER_INTERVAL = 1.0     # seconds between counter increments
+# Advance the counter on a timer, not per frame. A genuine AWDL master bumps its
+# self_counter once "every PI (3.14) seconds" while it is master (see the field
+# comment in src/frame.h), so match that cadence: it keeps the master live (far
+# inside the ~10 s window after which a frozen counter is treated as a dead
+# master) while behaving exactly like a real master -- neither frozen (looks
+# dead) nor incrementing every frame (every frame then looks like a new master
+# generation, making the victim re-elect constantly).
+MASTER_COUNTER_INTERVAL = 3.14    # seconds between counter increments (AWDL "PI")
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
@@ -1103,10 +1105,13 @@ def main(argv=None):
                              "--track is given")
     parser.add_argument("--track", type=parse_names, default=None,
                         action="append", metavar="NAME[,NAME...]",
-                        help="AWDL hostname(s) to follow (e.g. \"Peters-iPad\"); "
-                             "the tool sniffs, resolves each to the device's "
-                             "current MAC and re-targets automatically as the "
-                             "MAC rotates -- so you never re-enter a rotated MAC. "
+                        help="AWDL name(s) to follow -- the Arpa-TLV name a device "
+                             "broadcasts. On older devices this is the hostname "
+                             "(e.g. \"Peters-iPad\"); modern iOS/iPadOS randomises "
+                             "it to a UUID (run --watch to read it). The tool "
+                             "sniffs, resolves each name to the device's current "
+                             "MAC and re-targets automatically as the MAC rotates "
+                             "(works only while that name stays constant). "
                              "Comma-separated and/or repeatable; combinable with -t")
     parser.add_argument("-s", "--source", type=parse_mac, default=None,
                         help="source MAC / master identity to advertise "
@@ -1137,9 +1142,9 @@ def main(argv=None):
     parser.add_argument("--counter-interval", type=parse_duration,
                         default=MASTER_COUNTER_INTERVAL, metavar="TIME",
                         help="how often the election counter is advanced "
-                             "(s/ms/us/tu suffix; default 1s). Advancing per "
-                             "frame makes the victim re-elect on every frame, so "
-                             "each counter value is held for this long; 0 = never")
+                             "(s/ms/us/tu suffix; default 3.14s = the rate a real "
+                             "AWDL master uses). Advancing per frame makes the "
+                             "victim re-elect on every frame; 0 = every frame")
     parser.add_argument("--awdl-version", type=parse_awdl_version,
                         default=AWDL_VERSION_TLV_DEFAULT, metavar="VER",
                         help="AWDL version advertised in the Version TLV, e.g. "
