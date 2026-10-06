@@ -98,7 +98,7 @@ Useful options:
 | `--sweep-dwell` | seconds to listen per channel while detecting (default: 3.0) |
 | `--metric` | election master metric (default: `0xffffffff`) |
 | `--counter` | starting election master counter (default: `0x40000000`) |
-| `--counter-interval` | how often the counter is advanced (default: `1s`; `0` = never) |
+| `--counter-interval` | how often the counter is advanced (default: `3.14s`, a real master's rate; `0` = every frame) |
 | `--count` | number of frames to send (`0` = until Ctrl-C) |
 | `--psf` | also interleave PSF frames |
 | `--watch` | inject *and* listen on the same card; report each peer's master (and hostname) |
@@ -109,27 +109,32 @@ Useful options:
 ### Following a device across MAC rotation (`--track`)
 
 Apple devices rotate their Wi-Fi / AWDL MAC, so a MAC you pass to `-t` goes
-stale and you'd have to keep looking it up. They do, however, keep
-broadcasting a **stable hostname** in their MIFs (the Arpa TLV — the device
-name, e.g. `Peters-iPad`). AWDL carries no device *UUID* that survives
-rotation, but that hostname is a persistent handle, so `--track` follows it:
+stale and you'd have to keep looking it up. Each device also broadcasts an
+**AWDL name** in its MIFs (the Arpa TLV), which `--track` follows, resolving it
+to the device's current MAC and re-targeting automatically as the MAC rotates:
 
 ```sh
 sudo ./awdl_master_inject.py -i wlan0 -c 6 --track "Peters-iPad"
 ```
 
-The tool sniffs on the same card, resolves each tracked hostname to the
-device's **current** transmitter MAC, and re-targets automatically whenever
-the MAC rotates — you never re-enter a MAC. Notes:
+**What that name is matters.** On older devices it's the readable hostname
+(`Peters-iPad`). On modern iOS/iPadOS it's **randomised to a UUID** (e.g.
+`af98f343-bad6-4904-a36b-09c15adb795f`) for privacy — AWDL deliberately carries
+no clear-text device name there. Run `--watch` first to read whatever your
+target advertises, then pass that exact value to `--track`.
+
+Tracking only works **while that name stays constant across MAC rotations**.
+Use `--watch` to check: if you see the *same* name reappear on changing MACs,
+it's a stable handle and `--track` will follow it; if the name itself changes
+every time the MAC does, the device is rotating its identity too and nothing
+can follow it. Notes:
 
 * Matching is case-insensitive. Give several names comma-separated and/or by
   repeating `--track`, and combine freely with fixed `-t` MACs.
 * Until a tracked device is first heard, nothing is injected for it; a
   `[track] <name> -> <mac>` line is printed on first resolve and on each
   rotation (`[track] <name> rotated <old> -> <new>`).
-* The device must be actively sending AWDL (keep an AWDL feature in use), and
-  the hostname is whatever the device advertises (its name under *Settings →
-  General → About → Name*).
+* The device must be actively sending AWDL (keep an AWDL feature in use).
 
 ### Verifying with a single card (`--watch`)
 
@@ -243,11 +248,13 @@ sock.close()
 ```
 
 The election counter advances automatically on a timer (`counter_interval`,
-default 1 s) so the master never looks stale — advancing it *per frame* makes
-the victim re-elect on every frame, so each value is held for many frames;
-write `master_counter` through `store.update(...)` only if you want to
-override it. In single-channel mode a changed `channel` re-tunes the radio on
-the next cycle; with `rotate_channels` the rotation owns the channel.
+default 3.14 s — the rate a genuine AWDL master increments its `self_counter`,
+per `src/frame.h`). That keeps the master live without looking anomalous;
+advancing it *per frame* makes the victim treat every frame as a new master
+generation and re-elect constantly. Write `master_counter` through
+`store.update(...)` only if you want to override it. In single-channel mode a
+changed `channel` re-tunes the radio on the next cycle; with `rotate_channels`
+the rotation owns the channel.
 
 To follow devices by hostname from your own code, build a `HostnameTracker`
 and pass it to `run_injection(..., tracker=tracker)`; it keeps the store's
