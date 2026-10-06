@@ -744,23 +744,41 @@ def send_frame(sock, frame):
     return False
 
 
-def set_channel(ifname, channel):
-    """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success."""
-    try:
-        subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
-                       check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, timeout=5)
-        return True
-    except FileNotFoundError:
-        print("    channel %d: cannot tune ('iw' not found)" % channel)
-        return False
-    except subprocess.TimeoutExpired:
-        print("    channel %d: cannot tune (timeout)" % channel)
-        return False
-    except subprocess.CalledProcessError as exc:
-        reason = exc.stderr.decode(errors="replace").strip() or "rejected"
-        print("    channel %d: cannot tune (%s)" % (channel, reason))
-        return False
+def set_channel(ifname, channel, retries=4, delay=0.3):
+    """Tune ``ifname`` to ``channel`` via ``iw``. Returns True on success.
+
+    ``iw ... set channel`` can transiently fail with EBUSY ("Device or resource
+    busy", -16) when NetworkManager / wpa_supplicant is still managing the card
+    and its periodic scans hold the radio, so a busy failure is retried a few
+    times before giving up (with a hint on how to free the device).
+    """
+    reason = "rejected"
+    for attempt in range(retries + 1):
+        try:
+            subprocess.run(["iw", "dev", ifname, "set", "channel", str(channel)],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=5)
+            return True
+        except FileNotFoundError:
+            print("    channel %d: cannot tune ('iw' not found)" % channel)
+            return False
+        except subprocess.TimeoutExpired:
+            print("    channel %d: cannot tune (timeout)" % channel)
+            return False
+        except subprocess.CalledProcessError as exc:
+            reason = exc.stderr.decode(errors="replace").strip() or "rejected"
+            busy = "busy" in reason.lower() or "-16" in reason
+            if busy and attempt < retries:
+                time.sleep(delay)       # radio momentarily busy; wait and retry
+                continue
+            print("    channel %d: cannot tune (%s)" % (channel, reason))
+            if busy:
+                print("        the radio is busy -- NetworkManager/wpa_supplicant"
+                      " likely still manages %s." % ifname)
+                print("        run with --setup, or free it first:  "
+                      "sudo nmcli dev set %s managed no" % ifname)
+            return False
+    return False
 
 
 def parse_awdl_info(buf):

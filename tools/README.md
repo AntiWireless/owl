@@ -44,11 +44,15 @@ No third-party Python modules are needed (raw `AF_PACKET` injection).
 
 ### Preparing the Wi-Fi stick
 
-`awdl_prepare_stick.sh` gets a card ready for injection. It forces a **clean,
-plain monitor interface** — recreating the interface to drop any stale
-*active* monitor flag, which is the root cause of the peer-instability seen on
-USB adapters such as the `mt76x0u` — and sets a **regulatory domain** that
-permits the 5 GHz AWDL channels (44/149):
+`awdl_prepare_stick.sh` gets a card ready for injection. It:
+
+* **releases the interface from NetworkManager / wpa_supplicant** — their
+  periodic scans keep the radio busy, which makes `iw ... set channel` fail
+  with `Device or resource busy (-16)`;
+* forces a **clean, plain monitor interface** — recreating the interface to
+  drop any stale *active* monitor flag, the root cause of the peer-instability
+  seen on USB adapters such as the `mt76x0u`;
+* sets a **regulatory domain** that permits the 5 GHz AWDL channels (44/149).
 
 ```sh
 sudo ./awdl_prepare_stick.sh wlan0 44        # <iface> [channel] [regdomain]
@@ -60,6 +64,11 @@ so a one-liner prepares the card and injects:
 ```sh
 sudo ./awdl_master_inject.py -i wlan0 -t 11:22:33:44:55:66 -c 44 --setup
 ```
+
+> **`cannot tune (Device or resource busy -16)`?** The radio is still managed
+> by NetworkManager/wpa_supplicant. Use `--setup` (it releases the device), or
+> free it manually: `sudo nmcli dev set wlan0 managed no`. Re-enable normal
+> Wi-Fi afterwards with `sudo nmcli dev set wlan0 managed yes`.
 
 ### Usage
 

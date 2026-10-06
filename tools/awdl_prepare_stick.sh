@@ -55,8 +55,23 @@ if [ -n "$CHANNEL" ]; then
 	esac
 fi
 
-# Regulatory domain first: the 5 GHz AWDL channels (44/149) are blocked under
-# the default 'world' domain on many adapters.
+# Stop NetworkManager / wpa_supplicant from managing the device. Their periodic
+# scans keep the radio busy, which makes `iw ... set channel` fail with EBUSY
+# ("Device or resource busy", -16). Releasing the interface is reversible:
+# re-manage later with `nmcli dev set <iface> managed yes`.
+if command -v nmcli >/dev/null 2>&1; then
+	note "releasing $IFACE from NetworkManager (set unmanaged)"
+	nmcli dev disconnect "$IFACE" 2>/dev/null || true
+	nmcli dev set "$IFACE" managed no 2>/dev/null \
+		|| note "warning: could not set $IFACE unmanaged in NetworkManager"
+fi
+if command -v wpa_cli >/dev/null 2>&1; then
+	# Detach any wpa_supplicant instance bound to this interface (best effort).
+	wpa_cli -i "$IFACE" terminate >/dev/null 2>&1 || true
+fi
+
+# Regulatory domain: the 5 GHz AWDL channels (44/149) are blocked under the
+# default 'world' domain on many adapters.
 note "setting regulatory domain to $REGDOM"
 iw reg set "$REGDOM" 2>/dev/null \
 	|| note "warning: could not set regulatory domain to $REGDOM"
@@ -102,8 +117,19 @@ ip link set "$IFACE" up || die "could not bring $IFACE up"
 
 if [ -n "$CHANNEL" ]; then
 	note "tuning $IFACE to channel $CHANNEL"
-	iw dev "$IFACE" set channel "$CHANNEL" 2>/dev/null \
-		|| note "warning: could not set channel $CHANNEL (regulatory domain?)"
+	# Retry on a transient EBUSY (the radio may settle a moment after bring-up).
+	tuned=0
+	i=0
+	while [ "$i" -lt 5 ]; do
+		if iw dev "$IFACE" set channel "$CHANNEL" 2>/dev/null; then
+			tuned=1
+			break
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+	[ "$tuned" -eq 1 ] \
+		|| note "warning: could not set channel $CHANNEL (still busy, or regulatory domain)"
 fi
 
 # Verify we really ended up in monitor mode.
