@@ -136,6 +136,35 @@ can follow it. Notes:
   rotation (`[track] <name> rotated <old> -> <new>`).
 * The device must be actively sending AWDL (keep an AWDL feature in use).
 
+### Covering a channel-hopping target (`--channels`)
+
+Apple devices hop across the social channels (6, 44, 149). With one radio you
+can't be on all of them at once, so a device parked on 44 stops hearing your
+master and, after ~10 s without a fresh counter, briefly re-elects itself
+(you'll see its `self_counter` tick up in `--watch`) before re-adopting you.
+
+Mitigations, in order of effort:
+
+* **Stay on its busiest channel.** Run the sweep (no `-c`) to see where the
+  target spends most frames, then pin there with `-c`.
+* **Rotate fast across the channels it uses.** A *short* dwell visits every
+  channel several times inside the ~10 s staleness window — unlike a long
+  dwell, which leaves each channel uncovered for too long:
+
+  ```sh
+  sudo ./awdl_master_inject.py -i wlan0 --channels 6,44,149 \
+       --channel-dwell 300ms --interval 110tu -t <mac>
+  ```
+
+* **Weight the rotation** toward the busiest channel by listing it more than
+  once — `--channels 6,6,44,149` spends half the dwell on 6.
+
+Hopping relies on `iw`, which the driver sometimes rejects while busy; the
+tool retries each tune and, if hops keep failing, prints a count at the end
+(shorten the channel list or raise `--channel-dwell` if that happens a lot).
+A single radio can't fully close the gap for a target that spends long
+stretches off your channel — that needs a second card (one per channel).
+
 ### Verifying with a single card (`--watch`)
 
 Monitor mode keeps receiving while you inject, so one card can both send the
