@@ -361,3 +361,56 @@ plain TCP, which still captures the MAC).
 Impersonating a service and recording identifiers of devices you do not own is
 unlawful in most places. Use the honeypot **only** against your own devices or
 with explicit authorisation, in an isolated RF lab.
+
+## `awdl_airdrop_find.py`
+
+Maps a receiver's **real device name** (e.g. `Peters iPad`) to its current
+**MAC**, then writes the chosen MAC out for the injector. Use this when you
+want to pick a target by its human name rather than the random AWDL UUID.
+
+Why a separate active step: the real name is **not** in the AWDL frames (there
+it is a random UUID) and is **not** sniffable — it is only revealed over the
+TLS-encrypted AirDrop `Discover` exchange, exactly as it appears on a sender's
+share sheet. So this tool briefly acts as an AirDrop *sender*: it browses
+`_airdrop._tcp` over AWDL and performs a `Discover` to each receiver to read
+its `ReceiverComputerName`. It reads only the display name — not the contact
+identifiers AirDrop matches on.
+
+### One radio, run in sequence
+
+Discovery and injection never run at the same time, so a single card is
+enough — managed (with `owl`) for discovery, then the **same** card in monitor
+mode for the injector:
+
+```sh
+# phase 1 — AWDL up, discover name <-> MAC, write the target MAC:
+sudo owl -i wlan0 -c 6 &
+sudo ./awdl_airdrop_find.py -i awdl0 --out captured_target.txt
+#   #  name                         model      MAC
+#   -----------------------------------------------------------
+#   0  Peters iPad                  iPad       66:aa:30:33:93:af
+#   1  ?(a1b2c3d4e5f6)              -          c2:34:56:78:9a:bc
+#   Pick a target by number (blank = first, q = none): 0
+
+# phase 2 — stop owl, put the card in monitor mode, then hijack:
+sudo ./awdl_master_inject.py -i wlan0 --targets-file captured_target.txt \
+     --channels 6,6,44,149 --channel-dwell 300ms --interval 110tu
+```
+
+Selection can be scripted with `--first`, `--pick N`, `--name-filter Peters`
+(auto-pick the first name containing the substring) or `--all`. Other options:
+`--timeout` (browse seconds), `--no-discover` (list MACs only, names stay
+unknown), `--no-tls-cert`, `--self-test` (offline checks, no radio).
+
+**Caveats:** the receiver must be discoverable (AirDrop *Everyone*, or you in
+its contacts), and the `Discover` TLS/plist handshake can need tuning against a
+given iOS version. If a receiver shows up by MAC but the name stays `?(...)`,
+the Discover didn't complete — **OpenDrop** (`opendrop find`) is the proven
+fallback for reading the name; feed the MAC it shows to `--targets-file`
+yourself.
+
+### ⚠️ Authorised use only
+
+Querying devices and recording their names/addresses without authorisation is
+unlawful in most places. Use this **only** against your own devices or with
+explicit authorisation, in an isolated RF lab.

@@ -296,10 +296,12 @@ def mdns_responder(sock, ifindex, instance, host, addr6_packed, port, txt, stop)
 # TLS listener (connection = capture point)
 # ---------------------------------------------------------------------------
 
-def make_self_signed_context():
-    """A throwaway self-signed TLS context. iOS may reject the cert, but the
-    TCP/TLS connection has already revealed the peer's MAC by then, which is
-    all we need. Returns None if a cert can't be generated (then plain TCP)."""
+def generate_self_signed_certfiles():
+    """Write a throwaway self-signed cert+key to a temp dir and return their
+    (cert_path, key_path), or (None, None) if the 'cryptography' module is not
+    installed. AirDrop uses TLS with Apple-issued certs, but devices in
+    'Everyone' mode accept a self-signed one for discovery, and either way the
+    TCP/TLS connection already carries the peer address."""
     try:
         import datetime
         from cryptography import x509
@@ -307,7 +309,7 @@ def make_self_signed_context():
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
     except ImportError:
-        return None
+        return None, None
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, u"airdrop")])
     now = datetime.datetime.utcnow()
@@ -326,6 +328,15 @@ def make_self_signed_context():
         f.write(key.private_bytes(serialization.Encoding.PEM,
                                   serialization.PrivateFormat.TraditionalOpenSSL,
                                   serialization.NoEncryption()))
+    return cpath, kpath
+
+
+def make_self_signed_context():
+    """A throwaway self-signed TLS *server* context, or None if no cert could
+    be generated (the listener then falls back to plain TCP)."""
+    cpath, kpath = generate_self_signed_certfiles()
+    if cpath is None:
+        return None
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cpath, kpath)
     return ctx
