@@ -93,6 +93,7 @@ Useful options:
 | --- | --- |
 | `-t, --target` | destination MAC(s) the frames are directed at — comma-separated and/or repeatable (required unless `--track`) |
 | `--track` | AWDL hostname(s) to follow; resolved to the current MAC by sniffing, re-targeted automatically as it rotates |
+| `--targets-file` | read target MAC(s) from a file (one per line); pairs with the AirDrop honeypot below |
 | `-s, --source` | master identity to advertise (default: interface MAC) |
 | `-c, --channel` | AWDL social channel 6/44/149 (default: auto-detect by sweep) |
 | `--sweep-dwell` | seconds to listen per channel while detecting (default: 3.0) |
@@ -303,3 +304,113 @@ devices you own or are explicitly authorised to test, in an isolated RF lab.
 This reproduces the election-manipulation behaviour studied by the OWL authors
 in *"A Billion Open Interfaces for Eve and Mallory"* (USENIX Security '19).
 Like the rest of OWL, it is experimental software — use it at your own risk.
+
+## `awdl_airdrop_honeypot.py`
+
+Poses as an AirDrop **receiver** and captures the **MAC of the first device
+that connects**, so you can feed that MAC straight into the injector — useful
+when you don't know a target's (rotating) MAC up front but can get someone to
+open their share sheet near you.
+
+When a sender opens the iOS/macOS share sheet it browses `_airdrop._tcp` over
+AWDL and **connects to each discovered receiver** (to fetch its name) *before*
+any file is chosen. The honeypot answers that mDNS browse and listens on the
+advertised port; the connection reveals the sender's AWDL link-local IPv6,
+from which the MAC is derived (AWDL uses EUI-64 addresses, so the MAC is
+embedded; the neighbour table is a fallback).
+
+It **does not** complete the transfer and **does not** try to recover the
+sender's identity (the BLE contact hashes / TLS validation record are out of
+scope) — it only records the link-layer address of a device that connected.
+
+### Workflow (needs two radios)
+
+The honeypot needs a working AWDL stack (`awdl0` from the `owl` daemon, managed
+mode); the injector needs monitor mode — one radio can't do both at once, so
+use two:
+
+```sh
+# radio A — bring AWDL up so awdl0 exists:
+sudo owl -i wlan0 -c 6 &
+
+# pose as an AirDrop receiver, capture the first sender's MAC:
+sudo ./awdl_airdrop_honeypot.py -i awdl0 --once --out captured_target.txt
+
+# radio B — hijack the captured device as AWDL master:
+sudo ./awdl_master_inject.py -i wlan1 --targets-file captured_target.txt \
+     --channels 6,6,44,149 --channel-dwell 300ms --interval 110tu
+```
+
+```
+[+] AirDrop sender connected: fe80::1cb3:...%awdl0  ->  MAC 66:aa:30:33:93:af   <== FIRST
+```
+
+Options: `-i` (AWDL interface, default `awdl0`), `--port` (advertised SRV
+port), `--name` (instance id), `--out` (file the injector reads), `--once`
+(stop after the first capture), `--no-tls` (plain TCP; the MAC is captured
+either way), `--self-test` (offline unit checks, no radio needed).
+
+**Caveats:** this is a lab scaffold. Whether real iOS actually connects can
+depend on the OS version, the sharing mode (*Everyone* is easiest) and a BLE
+trigger — verify in your lab. The TLS certificate is a throwaway self-signed
+one (needs the `cryptography` module; without it the listener falls back to
+plain TCP, which still captures the MAC).
+
+### ⚠️ Authorised use only
+
+Impersonating a service and recording identifiers of devices you do not own is
+unlawful in most places. Use the honeypot **only** against your own devices or
+with explicit authorisation, in an isolated RF lab.
+
+## `awdl_airdrop_find.py`
+
+Maps a receiver's **real device name** (e.g. `Peters iPad`) to its current
+**MAC**, then writes the chosen MAC out for the injector. Use this when you
+want to pick a target by its human name rather than the random AWDL UUID.
+
+Why a separate active step: the real name is **not** in the AWDL frames (there
+it is a random UUID) and is **not** sniffable — it is only revealed over the
+TLS-encrypted AirDrop `Discover` exchange, exactly as it appears on a sender's
+share sheet. So this tool briefly acts as an AirDrop *sender*: it browses
+`_airdrop._tcp` over AWDL and performs a `Discover` to each receiver to read
+its `ReceiverComputerName`. It reads only the display name — not the contact
+identifiers AirDrop matches on.
+
+### One radio, run in sequence
+
+Discovery and injection never run at the same time, so a single card is
+enough — managed (with `owl`) for discovery, then the **same** card in monitor
+mode for the injector:
+
+```sh
+# phase 1 — AWDL up, discover name <-> MAC, write the target MAC:
+sudo owl -i wlan0 -c 6 &
+sudo ./awdl_airdrop_find.py -i awdl0 --out captured_target.txt
+#   #  name                         model      MAC
+#   -----------------------------------------------------------
+#   0  Peters iPad                  iPad       66:aa:30:33:93:af
+#   1  ?(a1b2c3d4e5f6)              -          c2:34:56:78:9a:bc
+#   Pick a target by number (blank = first, q = none): 0
+
+# phase 2 — stop owl, put the card in monitor mode, then hijack:
+sudo ./awdl_master_inject.py -i wlan0 --targets-file captured_target.txt \
+     --channels 6,6,44,149 --channel-dwell 300ms --interval 110tu
+```
+
+Selection can be scripted with `--first`, `--pick N`, `--name-filter Peters`
+(auto-pick the first name containing the substring) or `--all`. Other options:
+`--timeout` (browse seconds), `--no-discover` (list MACs only, names stay
+unknown), `--no-tls-cert`, `--self-test` (offline checks, no radio).
+
+**Caveats:** the receiver must be discoverable (AirDrop *Everyone*, or you in
+its contacts), and the `Discover` TLS/plist handshake can need tuning against a
+given iOS version. If a receiver shows up by MAC but the name stays `?(...)`,
+the Discover didn't complete — **OpenDrop** (`opendrop find`) is the proven
+fallback for reading the name; feed the MAC it shows to `--targets-file`
+yourself.
+
+### ⚠️ Authorised use only
+
+Querying devices and recording their names/addresses without authorisation is
+unlawful in most places. Use this **only** against your own devices or with
+explicit authorisation, in an isolated RF lab.
