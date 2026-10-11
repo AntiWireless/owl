@@ -143,7 +143,19 @@ can't be on all of them at once, so a device parked on 44 stops hearing your
 master and, after ~10 s without a fresh counter, briefly re-elects itself
 (you'll see its `self_counter` tick up in `--watch`) before re-adopting you.
 
-Mitigations, in order of effort:
+**Counter freshness while hopping.** The election counter is advanced only at a
+channel-switch boundary, never mid-visit, so every frame of a single channel
+visit carries one stable counter value. This matters because the victim treats
+any *new* counter value as a fresh master generation and only settles once it
+has seen that value repeated: a bump landing between the ~2-3 frames of a short
+visit would send a lone, never-confirmed new counter right before the radio
+hops away, and the victim would re-elect itself (its `self_counter` ticks up)
+and only re-adopt you after re-hearing you — i.e. you'd become master briefly,
+then lose it for a while. Aligning the bump to the hop removes that self-
+inflicted flapping; the ~3.14 s real-master cadence is kept (`--counter-interval`
+tunes it, and can be lowered for a target with a shorter staleness window).
+
+Mitigations for the residual, unavoidable single-radio gap, in order of effort:
 
 * **Stay on its busiest channel.** Run the sweep (no `-c`) to see where the
   target spends most frames, then pin there with `-c`.

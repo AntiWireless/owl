@@ -173,6 +173,13 @@ MASTER_COUNTER_STEP = 1
 # master) while behaving exactly like a real master -- neither frozen (looks
 # dead) nor incrementing every frame (every frame then looks like a new master
 # generation, making the victim re-elect constantly).
+#
+# When hopping across channels the bump is additionally *aligned to a channel
+# switch* (see run_injection): a counter change landing mid-visit would make the
+# last frame before a hop carry a lone, never-repeated new value, which the
+# victim reads as an unconfirmed new master generation and re-elects on -- the
+# "master briefly, then lost" flapping. Bumping only at a visit boundary gives
+# each visit one value the victim sees repeated and can confirm.
 MASTER_COUNTER_INTERVAL = 3.14    # seconds between counter increments (AWDL "PI")
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
@@ -1056,13 +1063,44 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
         # otherwise leave us injecting on the wrong channel while believing we
         # moved, so we keep the old channel and retry on the next cycle.
         desired = rotate_channels[ci] if multi else snap["channel"]
+        switched = False
         if desired != current_channel:
             if set_channel(ifname, desired, quiet=True):
                 current_channel = desired
+                switched = True
                 if multi:
                     store.update(channel=desired)
             else:
                 hop_fail += 1
+
+        # Keep the master "live" by advancing the election counter -- but do it
+        # *before* building this cycle's frames and, when hopping, only right
+        # after a channel switch, so every frame of one channel visit carries a
+        # single, stable counter value.
+        #
+        # Why the alignment matters: the victim treats a *new* counter value as
+        # a fresh master generation and only settles once it has seen that value
+        # repeated. The old code bumped on a bare wall-clock timer, uncorrelated
+        # with the ~2-3 frames sent per short visit, so a bump landing mid-visit
+        # made the *last* frame before a hop carry a lone, never-repeated new
+        # counter. The victim then re-elected itself (its self_counter ticks up)
+        # and only re-adopted us after re-hearing and confirming us -- the
+        # "becomes master briefly, then loses it for a while" flapping. Bumping
+        # only at a visit boundary gives each visit one confirmable value. The
+        # ~counter_interval cadence (a real master's rate) is preserved by only
+        # bumping on the first switch after the interval has elapsed. In
+        # single-channel mode there are no hops, so fall back to the timer (the
+        # victim sees every value repeated across many frames there anyway).
+        now = time.monotonic()
+        if multi:
+            do_bump = switched and (counter_interval <= 0 or now >= next_counter_bump)
+        else:
+            do_bump = counter_interval <= 0 or now >= next_counter_bump
+        if do_bump:
+            new_counter = store.advance_counter(counter_step, UINT32_MAX)
+            snap["master_counter"] = new_counter
+            snap["self_counter"] = new_counter
+            next_counter_bump = now + counter_interval
 
         apply_snapshot(builder, snap)
         builder.channel = current_channel
@@ -1088,13 +1126,6 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                     sent += 1
                 else:
                     dropped += 1
-
-        # keep the master "live": advance the counter on a timer (not per frame,
-        # which would make the victim re-elect on every frame) but well within
-        # the staleness window
-        if counter_interval <= 0 or time.monotonic() >= next_counter_bump:
-            store.advance_counter(counter_step, UINT32_MAX)
-            next_counter_bump = time.monotonic() + counter_interval
 
         if watch or tracker is not None:
             changes = poll_rx(sock, snap["source"],
@@ -1196,8 +1227,11 @@ def main(argv=None):
                         default=MASTER_COUNTER_INTERVAL, metavar="TIME",
                         help="how often the election counter is advanced "
                              "(s/ms/us/tu suffix; default 3.14s = the rate a real "
-                             "AWDL master uses). Advancing per frame makes the "
-                             "victim re-elect on every frame; 0 = every frame")
+                             "AWDL master uses). When hopping (--channels) the "
+                             "bump is snapped to a channel switch so each visit "
+                             "carries one stable value the victim can confirm; "
+                             "0 = bump every switch (every frame in single-channel "
+                             "mode)")
     parser.add_argument("--awdl-version", type=parse_awdl_version,
                         default=AWDL_VERSION_TLV_DEFAULT, metavar="VER",
                         help="AWDL version advertised in the Version TLV, e.g. "
