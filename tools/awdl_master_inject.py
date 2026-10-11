@@ -233,6 +233,25 @@ def parse_names(text):
     return names
 
 
+def read_targets_file(path):
+    """Read target MACs from a file: one per line, ``#`` comments and blank
+    lines ignored. Returns a list of 6-byte MACs (de-duplicated, in order)."""
+    macs = []
+    with open(path) as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            try:
+                mac = parse_mac(line)
+            except argparse.ArgumentTypeError:
+                raise argparse.ArgumentTypeError(
+                    "%s:%d: invalid MAC %r" % (path, lineno, line))
+            if mac not in macs:
+                macs.append(mac)
+    return macs
+
+
 def mac_str(raw):
     return ":".join("%02x" % b for b in raw)
 
@@ -1142,6 +1161,11 @@ def main(argv=None):
                              "MAC and re-targets automatically as the MAC rotates "
                              "(works only while that name stays constant). "
                              "Comma-separated and/or repeatable; combinable with -t")
+    parser.add_argument("--targets-file", default=None, metavar="PATH",
+                        help="read target MAC(s) from a file (one per line; "
+                             "'#' comments and blanks ignored), merged with any "
+                             "-t targets. Pairs with awdl_airdrop_honeypot.py, "
+                             "which writes captured sender MACs there")
     parser.add_argument("-s", "--source", type=parse_mac, default=None,
                         help="source MAC / master identity to advertise "
                              "(default: interface MAC, else random local MAC)")
@@ -1247,6 +1271,16 @@ def main(argv=None):
         for mac in group:
             if mac not in fixed_targets:
                 fixed_targets.append(mac)
+    if args.targets_file:
+        try:
+            file_macs = read_targets_file(args.targets_file)
+        except (OSError, argparse.ArgumentTypeError) as exc:
+            parser.error("--targets-file: %s" % exc)
+        for mac in file_macs:
+            if mac not in fixed_targets:
+                fixed_targets.append(mac)
+        print("[*] loaded %d target(s) from %s"
+              % (len(file_macs), args.targets_file))
     track_names = []
     for group in (args.track or []):
         for name in group:
