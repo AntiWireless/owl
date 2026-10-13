@@ -307,6 +307,119 @@ tracker = awdl.HostnameTracker(store, fixed=[], names=["Peters-iPad"])
 # store.get("targets") now tracks Peters-iPad's current MAC automatically
 ```
 
+`HostnameTracker` also exposes `add_target(name, mac=None)` and `add_fixed(mac)`
+for pushing a target in **at runtime from another thread** (both are
+lock-guarded). That is the seam `airdrop_target.py` uses.
+
+## `airdrop_target.py`
+
+Makes this PC show up as an **AirDrop target**. When an Apple device picks it on
+the share sheet and sends a file, the sender's **current AWDL MAC** is recovered
+from the link-local IPv6 of the incoming connection and handed — live, with no
+restart — to `awdl_master_inject` as its target. So you never have to look up
+the device's rotating MAC by hand: *the device tells you who it is by sending to
+you.*
+
+Where a monitor card is present it also resolves the device's **AWDL name /
+UUID** (the Arpa TLV it broadcasts) by sniffing, and tracks *that* instead of
+the raw MAC — so the injector keeps following the device across every MAC
+rotation, between sends, not only when a new file arrives.
+
+### How it works
+
+```
+AirDrop send ─▶ /Ask HTTPS request ─▶ capture sender's link-local IPv6 (+ plist id)
+             ─▶ IPv6 → current AWDL MAC   (reverse EUI-64 / `ip -6 neigh`)
+             ─▶ MAC  → AWDL UUID          (sniffed MIFs, optional)
+             ─▶ HostnameTracker.add_target(uuid, mac)   (live retarget)
+             ─▶ awdl_master_inject keeps mastering the device
+```
+
+The identity bridge relies on OWL's own behaviour: OWL creates `awdl0` and
+installs each peer's MAC ↔ link-local-IPv6 mapping (RFC 4291 modified EUI-64)
+into the kernel neighbor table, so the MAC is directly recoverable from the
+socket peer address of the AirDrop connection — available at the very first
+request, before any plist is parsed.
+
+Two "identities" are captured and they appear at different layers:
+
+* the **MAC** (what the injector targets, and the thing that rotates) — a
+  transport fact from the peer IPv6, known the instant the device connects;
+* the **AWDL UUID** (`Arpa` TLV, e.g. `af98f343-bad6-4904-a36b-09c15adb795f` on
+  modern iOS) — a frame-layer fact, resolved by the monitor-card sniffer, used
+  to follow MAC rotation. The AirDrop `SenderComputerName` / `SenderID` from the
+  `/Ask` plist are also logged as a human-readable label.
+
+### Requirements
+
+* Linux, Python 3.6+, **root**
+* the **OWL daemon running** (so `awdl0` exists with a link-local IPv6):
+  `sudo owl -i wlan0`
+* a Wi-Fi card in **monitor mode** (for the injector and for UUID sniffing)
+* for discovery: the python **`zeroconf`** module (recommended) or
+  `avahi-publish-service` / `dns-sd`
+* for the self-signed TLS cert: the **`cryptography`** module or the `openssl` CLI
+
+Optional: the SEEMOO **`opendrop`** package — if installed it can be used as the
+receiver engine (`--backend opendrop`) for maximum protocol fidelity; otherwise
+a self-contained stdlib receiver is used.
+
+### Usage
+
+```sh
+# 1. bring up awdl0 (separate daemon) and prepare the monitor card
+sudo owl -i wlan0 &
+sudo ./awdl_prepare_stick.sh wlan0 44
+
+# 2. run the AirDrop target + injector in one process
+sudo ./airdrop_target.py -i wlan0 --channels 6,6,44,149 \
+     --channel-dwell 300ms --interval 110tu -n "Lab-Mac"
+```
+
+Then on the device: **AirDrop → Everyone** (for 10 minutes), open the share
+sheet, pick the name you passed to `-n`, and send any file. The injector
+immediately locks onto whichever device just sent and masters it, following its
+MAC rotation by the resolved UUID.
+
+The channel / timing / identity flags (`--channels`, `--channel-dwell`,
+`--interval`, `--counter-interval`, `-s`, `--awdl-version`, `--hostname`, …) are
+the same as `awdl_master_inject.py` and are passed straight through to the
+injector.
+
+Useful options:
+
+| option | meaning |
+| --- | --- |
+| `-i, --interface` | monitor-mode Wi-Fi card (injector + UUID sniff), required |
+| `--awdl-iface` | the AWDL interface OWL created (default `awdl0`) |
+| `-n, --name` | receiver name shown on the sender's share sheet |
+| `--trigger` | capture on the file-send (`ask`, default), on browse (`discover`), or `both` |
+| `--no-inject` | capture only: print each device's identity and the injector command, don't inject |
+| `--no-resolve-uuid` | track only the captured MAC (re-captured on each send), skip UUID sniffing |
+| `--backend` | `auto` (default), `builtin`, or `opendrop` |
+| `--decline` | decline the transfer after capturing (don't receive the file) |
+| `--download-dir` | save received files here (default: none kept) |
+| `--port` | AirDrop HTTPS port to advertise/listen on (default 8771) |
+
+### Capture-only
+
+`--no-inject` makes it a pure identity probe: it prints, for each device that
+sends, the resolved MAC/UUID and the exact `awdl_master_inject.py` command to
+run by hand — handy for discovering a target's stable UUID to later pass to
+`--track`.
+
+### Caveats
+
+* The device must have AirDrop set to **Everyone** and its **share sheet open**
+  (that is what activates its AWDL). A Linux receiver cannot wake a dormant
+  Apple device (that needs the BLE trigger, which is out of scope); it only
+  needs to be discoverable once the sender is active.
+* Everything is IPv6 over `awdl0`; `owl` must be up first or the tool exits with
+  a hint. Check with `ip addr show awdl0` and `ip -6 neigh`.
+* Contacts-Only senders will not show a non-contact Linux box; use Everyone.
+* Single-radio channel coverage applies exactly as for `awdl_master_inject`
+  (see above): keep the device on a channel the rotation visits.
+
 ### ⚠️ Authorised use only
 
 AWDL is always on on Apple devices, and forcing a foreign master disrupts the
